@@ -23,71 +23,6 @@ def _pad_to(x: int, align: int) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# ref_kernel: calls AITER fused_moe with MXFP4 quantized weights
-# ──────────────────────────────────────────────────────────────────────
-def ref_kernel(data: input_t) -> output_t:
-    """
-    Reference implementation using AITER's fused_moe kernel with MXFP4 quantized weights.
-
-    Matches the Mxfp4MoEMethod.apply() codepath in atom/model_ops/moe.py.
-
-    Input data tuple:
-        hidden_states:                [M, d_hidden]                           bf16
-        gate_up_weight:               [E, 2*d_expert_pad, d_hidden_pad//2]    fp4x2  (raw, before shuffle)
-        down_weight:                  [E, d_hidden_pad, d_expert_pad//2]      fp4x2  (raw, before shuffle)
-        gate_up_weight_scale:         [E, 2*d_expert_pad, scale_K]            e8m0   (raw, before shuffle)
-        down_weight_scale:            [E, d_hidden_pad, scale_K]              e8m0   (raw, before shuffle)
-        gate_up_weight_shuffled:      [E, 2*d_expert_pad, d_hidden_pad//2]    fp4x2  (shuffled for CK kernel)
-        down_weight_shuffled:         [E, d_hidden_pad, d_expert_pad//2]      fp4x2  (shuffled for CK kernel)
-        gate_up_weight_scale_shuffled:[padded, flat]                          e8m0   (shuffled for CK kernel)
-        down_weight_scale_shuffled:   [padded, flat]                          e8m0   (shuffled for CK kernel)
-        topk_weights:                 [M, top_k]                              float32
-        topk_ids:                     [M, top_k]                              int32
-        config:                       dict
-
-    Returns:
-        output: [M, d_hidden] bf16
-    """
-    (
-        hidden_states,
-        gate_up_weight,
-        down_weight,
-        gate_up_weight_scale,
-        down_weight_scale,
-        gate_up_weight_shuffled,
-        down_weight_shuffled,
-        gate_up_weight_scale_shuffled,
-        down_weight_scale_shuffled,
-        topk_weights,
-        topk_ids,
-        config,
-    ) = data
-
-    hidden_pad = config["d_hidden_pad"] - config["d_hidden"]
-    intermediate_pad = config["d_expert_pad"] - config["d_expert"]
-
-    output = fused_moe(
-        hidden_states,
-        gate_up_weight_shuffled,
-        down_weight_shuffled,
-        topk_weights,
-        topk_ids,
-        expert_mask=None,
-        activation=ActivationType.Silu,
-        quant_type=QuantType.per_1x32,  # MXFP4 uses per_1x32 block scaling
-        doweight_stage1=False,
-        w1_scale=gate_up_weight_scale_shuffled,
-        w2_scale=down_weight_scale_shuffled,
-        a1_scale=None,
-        a2_scale=None,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-    )
-
-    return output
-
-
-# ──────────────────────────────────────────────────────────────────────
 # generate_input: produce all tensors needed by ref_kernel
 #
 # Models DeepSeek-R1 MoE layer shapes:
@@ -203,5 +138,67 @@ def generate_input(
         config,
     )
 
+
+# ──────────────────────────────────────────────────────────────────────
+# ref_kernel: calls AITER fused_moe with MXFP4 quantized weights
+# ──────────────────────────────────────────────────────────────────────
+def ref_kernel(data: input_t) -> output_t:
+    """
+    Reference implementation using AITER's fused_moe kernel with MXFP4 quantized weights.
+
+    Input data tuple:
+        hidden_states:                [M, d_hidden]                           bf16
+        gate_up_weight:               [E, 2*d_expert_pad, d_hidden_pad//2]    fp4x2  (raw, before shuffle)
+        down_weight:                  [E, d_hidden_pad, d_expert_pad//2]      fp4x2  (raw, before shuffle)
+        gate_up_weight_scale:         [E, 2*d_expert_pad, scale_K]            e8m0   (raw, before shuffle)
+        down_weight_scale:            [E, d_hidden_pad, scale_K]              e8m0   (raw, before shuffle)
+        gate_up_weight_shuffled:      [E, 2*d_expert_pad, d_hidden_pad//2]    fp4x2  (pre-shuffled)
+        down_weight_shuffled:         [E, d_hidden_pad, d_expert_pad//2]      fp4x2  (pre-shuffled)
+        gate_up_weight_scale_shuffled:[padded, flat]                          e8m0   (pre-shuffled)
+        down_weight_scale_shuffled:   [padded, flat]                          e8m0   (pre-shuffled)
+        topk_weights:                 [M, top_k]                              float32
+        topk_ids:                     [M, top_k]                              int32
+        config:                       dict
+
+    Returns:
+        output: [M, d_hidden] bf16
+    """
+    (
+        hidden_states,
+        gate_up_weight,
+        down_weight,
+        gate_up_weight_scale,
+        down_weight_scale,
+        gate_up_weight_shuffled,
+        down_weight_shuffled,
+        gate_up_weight_scale_shuffled,
+        down_weight_scale_shuffled,
+        topk_weights,
+        topk_ids,
+        config,
+    ) = data
+
+    hidden_pad = config["d_hidden_pad"] - config["d_hidden"]
+    intermediate_pad = config["d_expert_pad"] - config["d_expert"]
+
+    output = fused_moe(
+        hidden_states,
+        gate_up_weight_shuffled,
+        down_weight_shuffled,
+        topk_weights,
+        topk_ids,
+        expert_mask=None,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.per_1x32,  # MXFP4 uses per_1x32 block scaling
+        doweight_stage1=False,
+        w1_scale=gate_up_weight_scale_shuffled,
+        w2_scale=down_weight_scale_shuffled,
+        a1_scale=None,
+        a2_scale=None,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+    )
+
+    return output
 
 check_implementation = make_match_reference(ref_kernel, rtol=1e-2, atol=1e-2)

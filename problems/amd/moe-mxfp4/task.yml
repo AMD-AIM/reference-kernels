@@ -43,14 +43,14 @@ description: |
 
   Input:
     - hidden_states:                  [M, d_hidden]                          bf16
-    - gate_up_weight:                 [E, 2*d_expert_pad, d_hidden_pad//2]   fp4x2 (raw)
-    - down_weight:                    [E, d_hidden_pad, d_expert_pad//2]     fp4x2 (raw)
-    - gate_up_weight_scale:           [E, 2*d_expert_pad, d_hidden_pad//32]  e8m0  (raw)
-    - down_weight_scale:              [E, d_hidden_pad, d_expert_pad//32]    e8m0  (raw)
-    - gate_up_weight_shuffled:        [E, 2*d_expert_pad, d_hidden_pad//2]   fp4x2 (shuffled for CK)
-    - down_weight_shuffled:           [E, d_hidden_pad, d_expert_pad//2]     fp4x2 (shuffled for CK)
-    - gate_up_weight_scale_shuffled:  [padded, flat]                         e8m0  (shuffled for CK)
-    - down_weight_scale_shuffled:     [padded, flat]                         e8m0  (shuffled for CK)
+    - gate_up_weight:                 [E, 2*d_expert_pad, d_hidden_pad//2]   fp4x2 (raw, before shuffle)
+    - down_weight:                    [E, d_hidden_pad, d_expert_pad//2]     fp4x2 (raw, before shuffle)
+    - gate_up_weight_scale:           [E, 2*d_expert_pad, d_hidden_pad//32]  e8m0  (raw, before shuffle)
+    - down_weight_scale:              [E, d_hidden_pad, d_expert_pad//32]    e8m0  (raw, before shuffle)
+    - gate_up_weight_shuffled:        [E, 2*d_expert_pad, d_hidden_pad//2]   fp4x2 (pre-shuffled)
+    - down_weight_shuffled:           [E, d_hidden_pad, d_expert_pad//2]     fp4x2 (pre-shuffled)
+    - gate_up_weight_scale_shuffled:  [padded, flat]                         e8m0  (pre-shuffled)
+    - down_weight_scale_shuffled:     [padded, flat]                         e8m0  (pre-shuffled)
     - topk_weights:                   [M, top_k]                             float32
     - topk_ids:                       [M, top_k]                             int32
     - config:                         dict with dimensions
