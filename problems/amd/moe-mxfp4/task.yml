@@ -57,11 +57,8 @@ ranked_timeout: 840
 ranking_by: "geom"
 
 tests:
-  # Small: 16 experts, intermediate=1024, bs=8
   - {"dhidden": 4096, "dexpert": 1024, "nroutedexperts": 16, "nexpertspertoken": 4, "bs": 8, "seed": 9371}
-  # Medium: 32 experts, intermediate=2048, bs=32
   - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "bs": 32, "seed": 2291}
-  # Large: 64 experts, intermediate=1536, bs=128
   - {"dhidden": 4096, "dexpert": 1536, "nroutedexperts": 64, "nexpertspertoken": 6, "bs": 128, "seed": 81934}
 
 benchmarks:
