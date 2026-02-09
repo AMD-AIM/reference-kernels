@@ -20,8 +20,8 @@ def custom_kernel(data: input_t) -> output_t:
         down_weight_shuffled:         [E, d_hidden_pad, d_expert_pad//2]      fp4x2  (shuffled)
         gate_up_weight_scale_shuffled:[padded, flat]                          e8m0   (shuffled)
         down_weight_scale_shuffled:   [padded, flat]                          e8m0   (shuffled)
-        topk_weights:                 [M, top_k]                              float32
-        topk_ids:                     [M, top_k]                              int32
+        topk_weights:                 [M, total_top_k]                        float32
+        topk_ids:                     [M, total_top_k]                        int32
         config:                       dict
 
     Returns:
