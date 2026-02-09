@@ -60,18 +60,22 @@ def dequantize_kv_buffer(kv_buffer, config):
         return kv_buffer.to(torch.bfloat16) * kv_scale
     elif kv_dtype == "mxfp4":
         # MXFP4: unpack fp4x2 → f32 values, then apply E8M0 block scales
+        # Note: scale_e8m0 may be padded by dynamic_mxfp4_quant; trim to actual dims
         B, M, N_half = kv_buffer.shape
         N = N_half * 2
+        num_rows = B * M
+        block_size = 32
+        num_blocks = N // block_size  # actual blocks (e.g. 576/32 = 18)
 
         # Unpack FP4 to float32 (handles both fp4x2 and uint8 dtypes)
-        kv_2d = kv_buffer.reshape(B * M, N_half)
-        float_vals = mxfp4_to_f32(kv_2d)  # (B*M, N) float32
+        kv_2d = kv_buffer.reshape(num_rows, N_half)
+        float_vals = mxfp4_to_f32(kv_2d)  # (num_rows, N) float32
 
-        # Convert E8M0 scales to float32 and apply block-wise
-        scale_f32 = e8m0_to_f32(kv_scale)  # (B*M, num_blocks) float32
-        block_size = 32
-        num_blocks = scale_f32.shape[-1]
-        float_blocked = float_vals[:, :num_blocks * block_size].view(B * M, num_blocks, block_size)
+        # Convert E8M0 scales to float32 and trim padded dimensions
+        scale_f32 = e8m0_to_f32(kv_scale)  # (padded_rows, padded_blocks)
+        scale_f32 = scale_f32[:num_rows, :num_blocks]  # (num_rows, num_blocks)
+
+        float_blocked = float_vals.view(num_rows, num_blocks, block_size)
         scaled = float_blocked * scale_f32.unsqueeze(-1)
 
         return scaled.view(B, M, N).to(torch.bfloat16)
@@ -105,27 +109,21 @@ def custom_kernel(data: input_t) -> output_t:
         kv_s, kv_e = int(kv_indptr[i].item()), int(kv_indptr[i + 1].item())
 
         qi = q[q_s:q_e]               # (seq_q, nhead, 576)
-        kvc = kv_bf16[kv_s:kv_e]      # (seq_kv, 1, 576)
+        kvc = kv_bf16[kv_s:kv_e, 0]   # (seq_kv, 576)  squeeze kv_heads dim
 
         # Key: full 576 dims; Value: first 512 dims (kv_lora_rank)
-        ki = kvc.expand(-1, num_heads, -1)
-        vi, _ = torch.split(kvc, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-        vi = vi.expand(-1, num_heads, -1)
+        ki = kvc                       # (seq_kv, 576) — broadcast over heads
+        vi = kvc[:, :kv_lora_rank]     # (seq_kv, 512)
 
-        attn = torch.matmul(
-            qi.float() * sm_scale,
-            ki.float().transpose(-2, -1),
-        )
+        # Attention: (nhead, seq_q, 576) @ (576, seq_kv) → (nhead, seq_q, seq_kv)
+        qi_t = qi.float().permute(1, 0, 2)  # (nhead, seq_q, 576)
+        scores = torch.matmul(qi_t * sm_scale, ki.float().T)  # (nhead, seq_q, seq_kv)
 
-        seq_q, seq_kv = qi.shape[0], kvc.shape[0]
-        if seq_q == seq_kv:
-            mask = torch.triu(
-                torch.ones(seq_q, seq_kv, device=qi.device, dtype=torch.bool), diagonal=1
-            )
-            attn = attn.masked_fill(mask.unsqueeze(0), float("-inf"))
+        scores = F.softmax(scores, dim=-1)
 
-        attn = F.softmax(attn, dim=-1)
-        oi = torch.matmul(attn, vi.float())
+        # Output: (nhead, seq_q, seq_kv) @ (seq_kv, 512) → (nhead, seq_q, 512)
+        oi = torch.matmul(scores, vi.float())  # (nhead, seq_q, 512)
+        oi = oi.permute(1, 0, 2)               # (seq_q, nhead, 512)
         out_list.append(oi.to(torch.bfloat16))
 
     return torch.cat(out_list, dim=0)

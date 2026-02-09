@@ -8,10 +8,12 @@ output v_head_dim = kv_lora_rank = 512.
 KV cache dtype options:
   - bf16:  bfloat16, no scale — directly used by bf16 MLA kernel
   - fp8:   dynamic per-tensor quantization (sglang scaled_fp8_quant style),
-           scalar kv_scale — passed directly to MLA kernel (kernel handles fp8)
+           scalar kv_scale — passed to bf16-Q + fp8-KV persistent MLA kernel
   - mxfp4: block-32 MXFP4 quantization (aiter dynamic_mxfp4_quant),
            kv_buffer in fp4x2 dtype + kv_scale in fp8_e8m0 dtype
            → dequantized to bf16 first, then bf16 MLA kernel is used
+
+Decode uses persistent mode; prefill uses non-persistent mode.
 """
 
 import torch
@@ -21,7 +23,7 @@ from utils import match_reference
 
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter import dtypes as aiter_dtypes
-from aiter import get_mla_metadata_info_v1
+from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.utility.fp4_utils import (
     dynamic_mxfp4_quant,
     mxfp4_to_f32,
@@ -39,6 +41,9 @@ QK_ROPE_HEAD_DIM = 64
 QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM   # 576
 V_HEAD_DIM = KV_LORA_RANK                        # 512
 SM_SCALE = 1.0 / (QK_HEAD_DIM ** 0.5)
+
+PAGE_SIZE = 1
+NUM_KV_SPLITS = 32
 
 # FP8 dtype (platform-specific via aiter)
 FP8_DTYPE = aiter_dtypes.fp8
@@ -115,9 +120,12 @@ def dequantize_mxfp4(
     """
     Dequantize MXFP4 tensor using aiter utilities.
 
+    Note: dynamic_mxfp4_quant may pad both row and block dimensions in scale_e8m0.
+    We trim scales to match the actual data dimensions.
+
     Args:
         fp4_data:   packed FP4 data, shape [B, M, N//2] in fp4x2 or uint8
-        scale_e8m0: E8M0 block scale factors, shape [B*M, num_blocks] in fp8_e8m0 or uint8
+        scale_e8m0: E8M0 block scale factors (possibly padded) in fp8_e8m0
         orig_shape: original (B, M, N) for reshaping
         dtype:      output dtype
 
@@ -125,62 +133,78 @@ def dequantize_mxfp4(
         Dequantized tensor of shape orig_shape.
     """
     B, M, N = orig_shape
+    num_rows = B * M
+    block_size = 32
+    num_blocks = N // block_size  # actual blocks needed (e.g. 576/32 = 18)
 
     # Unpack FP4 to float32: mxfp4_to_f32 expects (..., N//2) -> (..., N)
-    fp4_data_2d = fp4_data.reshape(B * M, N // 2)
-    float_vals = mxfp4_to_f32(fp4_data_2d)  # (B*M, N)
+    fp4_data_2d = fp4_data.reshape(num_rows, N // 2)
+    float_vals = mxfp4_to_f32(fp4_data_2d)  # (num_rows, N)
 
-    # Convert E8M0 scales to float32
-    scale_f32 = e8m0_to_f32(scale_e8m0)  # (B*M, num_blocks)
+    # Convert E8M0 scales to float32 and trim padded dimensions
+    scale_f32 = e8m0_to_f32(scale_e8m0)  # (padded_rows, padded_blocks)
+    scale_f32 = scale_f32[:num_rows, :num_blocks]  # (num_rows, num_blocks)
 
-    # Apply block scales (block size = 32)
-    block_size = 32
-    num_blocks = scale_f32.shape[-1]
-    # Reshape for broadcasting: (B*M, num_blocks, block_size)
-    float_vals_blocked = float_vals[:, :num_blocks * block_size].view(B * M, num_blocks, block_size)
+    # Apply block scales
+    float_vals_blocked = float_vals.view(num_rows, num_blocks, block_size)
     scaled = float_vals_blocked * scale_f32.unsqueeze(-1)
 
     return scaled.view(B, M, N).to(dtype)
 
 
 # ---------------------------------------------------------------------------
-# Aiter MLA metadata helpers
+# Persistent mode metadata helpers
 # ---------------------------------------------------------------------------
 
 def _make_mla_decode_metadata(
     batch_size: int,
-    max_seqlen_qo: int,
+    max_q_len: int,
     nhead: int,
-    dtype: torch.dtype,
-    intra_batch_mode: bool = True,
-    num_kv_splits: int = 1,
+    nhead_kv: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    num_kv_splits: int = NUM_KV_SPLITS,
 ):
-    """Allocate work buffers for aiter mla_decode_fwd."""
-    fast_mode = False
-    (
-        (work_meta_data_size, work_meta_data_type),
-        (work_indptr_size, work_indptr_type),
-        (work_info_set_size, work_info_set_type),
-        (reduce_indptr_size, reduce_indptr_type),
-        (reduce_final_map_size, reduce_final_map_type),
-        (reduce_partial_map_size, reduce_partial_map_type),
-    ) = get_mla_metadata_info_v1(
-        batch_size, max_seqlen_qo, nhead, dtype, dtype,
-        is_sparse=False, fast_mode=fast_mode,
-        num_kv_splits=num_kv_splits, intra_batch_mode=intra_batch_mode,
+    """Allocate and populate work buffers for persistent mla_decode_fwd."""
+    info = get_mla_metadata_info_v1(
+        batch_size, max_q_len, nhead, q_dtype, kv_dtype,
+        is_sparse=False, fast_mode=False,
+        num_kv_splits=num_kv_splits, intra_batch_mode=True,
     )
+    work = [torch.empty(s, dtype=t, device="cuda") for s, t in info]
+    (work_metadata, work_indptr, work_info_set,
+     reduce_indptr, reduce_final_map, reduce_partial_map) = work
 
-    work_metadata = torch.empty(work_meta_data_size, dtype=work_meta_data_type, device="cuda")
-    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device="cuda")
-    work_info_set = torch.empty(work_info_set_size, dtype=work_info_set_type, device="cuda")
-    reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type, device="cuda")
-    reduce_final_map = torch.empty(reduce_final_map_size, dtype=reduce_final_map_type, device="cuda")
-    reduce_partial_map = torch.empty(reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda")
-
-    return (
-        work_metadata, work_indptr, work_info_set,
+    # Populate the metadata buffers
+    get_mla_metadata_v1(
+        qo_indptr, kv_indptr, kv_last_page_len,
+        nhead // nhead_kv,   # num_heads_per_head_k
+        nhead_kv,            # num_heads_k
+        True,                # is_causal
+        work_metadata, work_info_set, work_indptr,
         reduce_indptr, reduce_final_map, reduce_partial_map,
+        page_size=PAGE_SIZE,
+        kv_granularity=max(PAGE_SIZE, 16),
+        max_seqlen_qo=max_q_len,
+        uni_seqlen_qo=max_q_len,
+        fast_mode=False,
+        max_split_per_batch=num_kv_splits,
+        intra_batch_mode=True,
+        dtype_q=q_dtype,
+        dtype_kv=kv_dtype,
     )
+
+    return {
+        "work_meta_data": work_metadata,
+        "work_indptr": work_indptr,
+        "work_info_set": work_info_set,
+        "reduce_indptr": reduce_indptr,
+        "reduce_final_map": reduce_final_map,
+        "reduce_partial_map": reduce_partial_map,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -197,9 +221,12 @@ def _aiter_mla_attention(
     """
     MLA attention using aiter kernels (forward_absorb style).
 
-    For mxfp4: dequantize kv_buffer to bf16 first, then run bf16 MLA kernel.
-    For fp8:   pass fp8 kv_buffer + kv_scale directly to MLA kernel.
-    For bf16:  pass bf16 kv_buffer directly.
+    Decode: persistent mode with get_mla_metadata_v1.
+      - bf16:  bf16 MLA kernel directly
+      - fp8:   bf16-Q + fp8-KV kernel (a16w8), kv_scale passed through
+      - mxfp4: dequantize to bf16 first, then bf16 MLA kernel
+
+    Prefill: non-persistent mode (bf16 only).
 
     q:          (total_q, num_heads, 576)  bf16
     kv_buffer:  bf16:  (total_kv, 1, 576)  bfloat16
@@ -208,6 +235,7 @@ def _aiter_mla_attention(
     """
     batch_size = config["batch_size"]
     nq = config["num_heads"]
+    nkv = config["num_kv_heads"]
     dq = config["qk_head_dim"]
     dv = config["v_head_dim"]
     q_seq_len = config["q_seq_len"]
@@ -216,18 +244,22 @@ def _aiter_mla_attention(
 
     # For mxfp4: dequantize to bf16 first, then use bf16 MLA kernel
     if kv_dtype == "mxfp4":
-        kv_buffer_bf16 = dequantize_mxfp4(
+        kv_buffer = dequantize_mxfp4(
             kv_buffer, kv_scale,
             orig_shape=(kv_buffer.shape[0], kv_buffer.shape[1], dq),
         )
-        kv_buffer = kv_buffer_bf16
-        kv_scale = None  # bf16 MLA kernel, no scale needed
+        kv_scale = None
+        actual_kv_torch_dtype = torch.bfloat16
+    elif kv_dtype == "fp8":
+        actual_kv_torch_dtype = FP8_DTYPE
+    else:
+        actual_kv_torch_dtype = torch.bfloat16
 
     total_kv_len = int(kv_indptr[-1].item())
     kv_indices = torch.arange(total_kv_len, dtype=torch.int32, device="cuda")
 
-    # Reshape kv_buffer to 4D for aiter: (total_kv, 1, 1, dim)
-    kv_buffer_4d = kv_buffer.view(kv_buffer.shape[0], 1, 1, kv_buffer.shape[-1])
+    # Reshape kv_buffer to 4D for aiter: (total_kv, page_size=1, nhead_kv=1, dim)
+    kv_buffer_4d = kv_buffer.view(kv_buffer.shape[0], PAGE_SIZE, nkv, kv_buffer.shape[-1])
 
     is_decode = q_seq_len <= 4
 
@@ -235,9 +267,12 @@ def _aiter_mla_attention(
         max_q_len = q_seq_len
         kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
 
-        work = _make_mla_decode_metadata(
-            batch_size, max_q_len, nq, q.dtype,
-            intra_batch_mode=True, num_kv_splits=1,
+        # Build persistent-mode metadata
+        meta = _make_mla_decode_metadata(
+            batch_size, max_q_len, nq, nkv,
+            q.dtype, actual_kv_torch_dtype,
+            qo_indptr, kv_indptr, kv_last_page_len,
+            num_kv_splits=NUM_KV_SPLITS,
         )
 
         o = torch.empty((q.shape[0], nq, dv), dtype=torch.bfloat16, device="cuda")
@@ -250,20 +285,18 @@ def _aiter_mla_attention(
             kv_indices,
             kv_last_page_len,
             max_q_len,
+            page_size=PAGE_SIZE,
+            nhead_kv=nkv,
             sm_scale=SM_SCALE,
             logit_cap=0.0,
-            work_meta_data=work[0],
-            work_indptr=work[1],
-            work_info_set=work[2],
-            reduce_indptr=work[3],
-            reduce_final_map=work[4],
-            reduce_partial_map=work[5],
-            q_scale=None,
+            num_kv_splits=NUM_KV_SPLITS,
             kv_scale=kv_scale,
             intra_batch_mode=True,
+            **meta,
         )
         return o
     else:
+        # Prefill: non-persistent bf16 mode (mxfp4/fp8 already dequantized above)
         max_q_len = int((qo_indptr[1:] - qo_indptr[:-1]).max().item())
         kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
 
