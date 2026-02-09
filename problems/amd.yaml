@@ -25,3 +25,8 @@ problems:
     deadline: "2025-09-02"
     gpus:
       - MI300
+  - directory: amd/mla
+    name: amd-mla
+    deadline: "2026-02-28"
+    gpus:
+      - MI355X

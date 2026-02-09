@@ -1,0 +1,99 @@
+# name: mla-py
+
+files:
+  - {"name": "submission.py", "source": "@SUBMISSION@"}
+  - {"name": "task.py", "source": "task.py"}
+  - {"name": "utils.py", "source": "../utils.py"}
+  - {"name": "reference.py", "source": "reference.py"}
+  - {"name": "eval.py", "source": "../eval.py"}
+
+lang: "py"
+
+description: |
+  Implement a custom MLA (Multi-head Latent Attention) decode kernel optimized for MI355X.
+
+  This is the inner attention kernel from DeepSeek R1's forward_absorb MLA path.
+  The absorbed query and compressed KV cache are provided directly — you only need to
+  implement the **attention** computation with variable-length batching (indptr).
+
+  The reference implementation uses aiter MLA kernels (mla_decode_fwd / mla_prefill_fwd).
+  Your submission is checked for correctness against the aiter reference.
+
+  DeepSeek R1 forward_absorb MLA config:
+    - num_heads = 16 (query heads, after TP split)
+    - num_kv_heads = 1 (shared latent KV head)
+    - kv_lora_rank = 512
+    - qk_rope_head_dim = 64
+    - qk_head_dim = 576 (kv_lora_rank + qk_rope_head_dim, absorbed q/k dim)
+    - v_head_dim = 512 (= kv_lora_rank, output dim)
+    - sm_scale = 1/sqrt(576)
+    - dtype: q=bfloat16, kv_cache={bfloat16, fp8, mxfp4}
+    - decode only (q_seq_len is small, kv_seq_len is large)
+
+  KV buffer format (forward_absorb):
+    - Full 576 dims are used as keys (for Q@K^T score computation)
+    - First 512 dims (kv_lora_rank) are used as values (for output computation)
+
+  KV cache quantization:
+    - bf16:  kv_buffer in bfloat16 (total_kv, 1, 576), kv_scale=None
+    - fp8:   dynamic per-tensor FP8 quantization (sglang scaled_fp8_quant style)
+             kv_buffer in fp8 dtype (total_kv, 1, 576)
+             kv_scale is a scalar float32 tensor; dequant: kv_fp8.to(bf16) * kv_scale
+    - mxfp4: block-32 MXFP4 quantization (aiter dynamic_mxfp4_quant)
+             kv_buffer in aiter fp4x2 dtype (total_kv, 1, 288) — 2 FP4 E2M1 values per byte
+             kv_scale in aiter fp8_e8m0 dtype (total_kv, num_blocks) — per-block E8M0 scales
+             Reference dequantizes to bf16 first, then runs bf16 MLA kernel.
+             Participants can fuse dequantization with attention for better performance.
+
+  You will be given a tuple:
+  ```
+  (q, kv_buffer, qo_indptr, kv_indptr, config)
+  ```
+  where:
+    - q: (total_q, 16, 576) bfloat16 — absorbed query
+    - kv_buffer: see KV cache quantization section above
+    - qo_indptr: (batch_size+1,) int32 — query segment pointers
+    - kv_indptr: (batch_size+1,) int32 — KV segment pointers
+    - config: dict with MLA parameters (including kv_dtype, kv_scale)
+
+  Return:
+    - attention output: (total_q, 16, 512) bfloat16
+
+  Key optimization opportunities:
+    1. MQA: 1 KV head shared across 16 query heads — minimize redundant memory loads
+    2. Decode: small q_seq_len (1-4) vs large kv_seq_len (up to 16k) — memory-bound
+    3. Quantized KV cache: fp8/mxfp4 reduces memory bandwidth (the bottleneck for decode)
+       For mxfp4: fuse dequantization with attention to avoid materializing full bf16 buffer
+    4. Variable-length batching: indptr-based segmented attention
+    5. Split K/V from buffer: full 576 dims for keys, first 512 dims for values
+
+  The ranking criteria is the geometric mean of the benchmark results.
+
+config:
+  main: "eval.py"
+
+templates:
+  Python: "submission.py"
+
+test_timeout: 900
+benchmark_timeout: 900
+ranked_timeout: 1200
+
+tests:
+  - {"batchsize": 4, "qseqlen": 1, "kvseqlen": 256, "kvdtype": "bf16", "seed": 4217}
+  - {"batchsize": 8, "qseqlen": 1, "kvseqlen": 512, "kvdtype": "bf16", "seed": 2891}
+  - {"batchsize": 16, "qseqlen": 1, "kvseqlen": 1024, "kvdtype": "bf16", "seed": 7631}
+  - {"batchsize": 32, "qseqlen": 1, "kvseqlen": 1024, "kvdtype": "fp8", "seed": 5412}
+  - {"batchsize": 64, "qseqlen": 1, "kvseqlen": 2048, "kvdtype": "fp8", "seed": 1357}
+  - {"batchsize": 4, "qseqlen": 3, "kvseqlen": 1024, "kvdtype": "bf16", "seed": 9823}
+  - {"batchsize": 16, "qseqlen": 1, "kvseqlen": 1024, "kvdtype": "mxfp4", "seed": 3842}
+
+benchmarks:
+  - {"batchsize": 64, "qseqlen": 1, "kvseqlen": 4096, "kvdtype": "bf16", "seed": 8135}
+  - {"batchsize": 128, "qseqlen": 1, "kvseqlen": 4096, "kvdtype": "bf16", "seed": 6251}
+  - {"batchsize": 128, "qseqlen": 1, "kvseqlen": 8192, "kvdtype": "fp8", "seed": 5364}
+  - {"batchsize": 128, "qseqlen": 1, "kvseqlen": 16384, "kvdtype": "fp8", "seed": 7531}
+  - {"batchsize": 128, "qseqlen": 1, "kvseqlen": 8192, "kvdtype": "mxfp4", "seed": 4291}
+  - {"batchsize": 128, "qseqlen": 1, "kvseqlen": 16384, "kvdtype": "mxfp4", "seed": 6183}
+
+ranking_by: "geom"
