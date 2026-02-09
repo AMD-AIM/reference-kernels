@@ -201,4 +201,101 @@ def ref_kernel(data: input_t) -> output_t:
 
     return output
 
+# will not run. only for reference
+def ref_kernel_pytorch(data: input_t) -> output_t:
+    """
+    Pure PyTorch reference: dequantize MXFP4 weights -> bf16 matmul -> SwiGLU -> matmul.
+    Uses the raw (un-shuffled) weights.
+    """
+    (
+        hidden_states,             # [M, d_hidden]          bf16
+        gate_up_weight,            # [E, 2*d_expert_pad, d_hidden_pad//2]  fp4x2
+        down_weight,               # [E, d_hidden_pad, d_expert_pad//2]    fp4x2
+        gate_up_weight_scale,      # [E, 2*d_expert_pad, scale_K]          e8m0
+        down_weight_scale,         # [E, d_hidden_pad, scale_K]            e8m0
+        gate_up_weight_shuffled,
+        down_weight_shuffled,
+        gate_up_weight_scale_shuffled,
+        down_weight_scale_shuffled,
+        topk_weights,              # [M, top_k]  float32
+        topk_ids,                  # [M, top_k]  int32
+        config,
+    ) = data
+
+    d_hidden = config["d_hidden"]
+    d_expert = config["d_expert"]
+    d_hidden_pad = config["d_hidden_pad"]
+    d_expert_pad = config["d_expert_pad"]
+    M = hidden_states.shape[0]
+    top_k = topk_ids.shape[1]
+    E = gate_up_weight.shape[0]
+
+    # Dequantize all expert weights to float32
+    # gate_up: [E, 2*d_expert_pad, d_hidden_pad] -> trim to [E, 2*d_expert, d_hidden]
+    # down:    [E, d_hidden_pad, d_expert_pad]    -> trim to [E, d_hidden, d_expert]
+    gate_up_dq = torch.stack([
+        _dequant_mxfp4(gate_up_weight[e], gate_up_weight_scale[e])
+        for e in range(E)
+    ])  # [E, 2*d_expert_pad, d_hidden_pad]
+    gate_up_dq = gate_up_dq[:, :2 * d_expert, :d_hidden].to(torch.bfloat16)
+
+    down_dq = torch.stack([
+        _dequant_mxfp4(down_weight[e], down_weight_scale[e])
+        for e in range(E)
+    ])  # [E, d_hidden_pad, d_expert_pad]
+    down_dq = down_dq[:, :d_hidden, :d_expert].to(torch.bfloat16)
+
+    # Split gate_up -> gate [E, d_expert, d_hidden], up [E, d_expert, d_hidden]
+    gate_w, up_w = gate_up_dq.chunk(2, dim=1)  # each [E, d_expert, d_hidden]
+
+    # Per-token MoE forward
+    output = torch.zeros((M, d_hidden), dtype=torch.bfloat16, device=hidden_states.device)
+
+    for i in range(M):
+        x = hidden_states[i]  # [d_hidden]
+        for k in range(top_k):
+            eid = topk_ids[i, k].item()
+            w = topk_weights[i, k].item()
+
+            # Stage 1: gate_proj + up_proj + SwiGLU
+            gate_out = F.silu(x @ gate_w[eid].T)     # [d_expert]
+            up_out = x @ up_w[eid].T                  # [d_expert]
+            intermediate = gate_out * up_out           # [d_expert]
+
+            # Stage 2: down_proj
+            # down_dq[eid] is [d_hidden, d_expert], .T is [d_expert, d_hidden]
+            expert_out = intermediate @ down_dq[eid].T  # [d_hidden]
+
+            output[i] += w * expert_out
+
+    return output
+
+
+
+# ──────────────────────────────────────────────────────────────────────
+# ref_kernel_pytorch: pure PyTorch implementation (dequant + matmul)
+# ──────────────────────────────────────────────────────────────────────
+def _dequant_mxfp4(weight_fp4, scale_e8m0):
+    """
+    Dequantize MXFP4 weight to float32.
+
+    weight_fp4:  [N, K//2]  fp4x2  (raw, not shuffled)
+    scale_e8m0:  [padded_N, ceil(K/32)] e8m0   (M-dim padded to 256-align by dynamic_mxfp4_quant)
+
+    Returns: [N, K] float32
+    """
+    # fp4x2 -> float32 lookup: [N, K]
+    w_f32 = fp4_utils.mxfp4_to_f32(weight_fp4)            # [N, K]
+    # e8m0 -> float32 power-of-2 scale: [padded_N, scale_K]
+    s_f32 = fp4_utils.e8m0_to_f32(scale_e8m0)             # [padded_N, scale_K]
+    N, K = w_f32.shape
+    # Trim scale rows to match weight rows (scale M-dim is padded to 256)
+    s_f32 = s_f32[:N, :]
+    # Broadcast scale across block_size=32 columns
+    s_f32 = s_f32.repeat_interleave(MXFP4_BLOCK_SIZE, dim=-1)[:, :K]  # [N, K]
+    return w_f32 * s_f32
+
+
+
+
 check_implementation = make_match_reference(ref_kernel, rtol=1e-2, atol=1e-2)
