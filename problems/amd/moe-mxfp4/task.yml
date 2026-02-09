@@ -1,4 +1,4 @@
-# name: 3_moe
+# name: 3_moe_mxfp4
 
 files:
   - {"name": "submission.py", "source": "@SUBMISSION@"}
@@ -10,30 +10,40 @@ files:
 lang: "py"
 
 description: |
-  For a more complete description, see: https://tinyurl.com/amd-comp-moe
-  Implement a DeepSeek-style Mixture of Experts (MoE) layer for efficient transformer models
-  on a single MI300X device.
-  
-  MoE is a technique that allows scaling model capacity without proportionally increasing computational costs
-  by using a routing mechanism to selectively activate only a subset of parameters for each token.
-  
-  Your task:
-  - Implement token routing using a simple softmax-based learned router
-  - Route tokens to the top-k experts based on router probabilities
-  - Process tokens through their assigned experts
-  - Combine expert outputs weighted by router probabilities
-  - Calculate appropriate auxiliary losses for training stability
-  
+  Implement a DeepSeek-R1 style MXFP4 Mixture of Experts (MoE) fused kernel on MI355X.
+
+  The fused_moe kernel performs the following for each token:
+    1. Route token to top-k experts based on pre-computed routing weights
+    2. For each active expert, compute: gate_proj = SiLU(x @ W_gate), up_proj = x @ W_up
+    3. Compute intermediate = gate_proj * up_proj (SwiGLU-style)
+    4. Compute output = intermediate @ W_down
+    5. Weighted sum of expert outputs
+
+  All expert weights (W_gate, W_up, W_down) are in MXFP4 format with e8m0 block scales (block_size=32).
+  The W_gate and W_up are fused into a single w13 weight. Weights are pre-shuffled for CK kernel layout.
+
+  DeepSeek-R1 MoE specs:
+    - hidden_size = 7168, moe_intermediate_size = 2048
+    - 256 routed experts, top-8 routing
+    - 58 MoE layers (layer 3-60)
+
+  Three deployment scenarios (TP=8):
+    - bs=4:   decode, all 256 experts local, intermediate TP-split to 256
+    - bs=64:  EP=8, 32 experts per GPU, full intermediate=2048
+    - bs=256: EP=8, 32 experts per GPU, full intermediate=2048
+
   Input:
-  - `data`: Tuple of (input: torch.Tensor, weights: Dict[str, torch.Tensor], config: Dict)
-    - input: Input tensor of shape [bs, seq_len, d_hidden]
-    - weights: Dictionary containing model weights
-    - config: Dictionary containing model configuration parameters
-  
+    - hidden_states:    [M, 7168]                    bf16
+    - w13_weight:       [E, 2*d_expert_pad, 3584]    fp4x2 (shuffled)
+    - w2_weight:        [E, 7168, d_expert_pad//2]   fp4x2 (shuffled)
+    - w13_weight_scale: shuffled e8m0 block scales
+    - w2_weight_scale:  shuffled e8m0 block scales
+    - topk_weights:     [M, 8]                       float32
+    - topk_ids:         [M, 8]                       int32
+    - config:           dict with dimensions
+
   Output:
-  - Tuple containing:
-    - output: Processed tensor [bs, seq_len, d_model]
-    - aux_data: Dictionary with auxiliary data like router probabilities and losses
+    - output: [M, 7168] bf16
 
 config:
   main: "eval.py"
@@ -47,10 +57,20 @@ ranked_timeout: 840
 ranking_by: "geom"
 
 tests:
-  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 4, "nsharedexperts": 1, "nexpertspertoken": 4, "bs": 1, "seqlen": 512, "seed": 9371}
-  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 8, "nsharedexperts": 1, "nexpertspertoken": 4, "bs": 2, "seqlen": 512, "seed": 2291}
-  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 8, "nsharedexperts": 1, "nexpertspertoken": 4, "bs": 1, "seqlen": 8192, "seed": 81934}
+  # Small: 16 experts, intermediate=1024, bs=8
+  - {"dhidden": 4096, "dexpert": 1024, "nroutedexperts": 16, "nexpertspertoken": 4, "bs": 8, "seed": 9371}
+  # Medium: 32 experts, intermediate=2048, bs=32
+  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "bs": 32, "seed": 2291}
+  # Large: 64 experts, intermediate=1536, bs=128
+  - {"dhidden": 4096, "dexpert": 1536, "nroutedexperts": 64, "nexpertspertoken": 6, "bs": 128, "seed": 81934}
 
 benchmarks:
-  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nsharedexperts": 1, "nexpertspertoken": 4, "bs": 1, "seqlen": 2048, "seed": 9371}
-  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nsharedexperts": 1, "nexpertspertoken": 4, "bs": 1, "seqlen": 8192, "seed": 1212}
+  # EP off, bs 4-1024
+  - {"dhidden": 7168, "dexpert": 256, "nroutedexperts": 256, "nexpertspertoken": 8, "bs": 4, "seed": 9371}
+  - {"dhidden": 7168, "dexpert": 256, "nroutedexperts": 256, "nexpertspertoken": 8, "bs": 64, "seed": 2291}
+  - {"dhidden": 7168, "dexpert": 256, "nroutedexperts": 256, "nexpertspertoken": 8, "bs": 256, "seed": 81934}
+  - {"dhidden": 7168, "dexpert": 256, "nroutedexperts": 256, "nexpertspertoken": 8, "bs": 1024, "seed": 81934}
+  # EP on, bs 64-1024
+  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "bs": 64, "seed": 2291}
+  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "bs": 256, "seed": 81934}
+  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "bs": 1024, "seed": 81934}

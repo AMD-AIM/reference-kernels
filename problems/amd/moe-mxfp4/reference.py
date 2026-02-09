@@ -1,244 +1,207 @@
 from utils import make_match_reference
 from task import input_t, output_t
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, Optional
 import math
+
+from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe
-
-# Reference code in PyTorch
-class Expert(nn.Module):
-    def __init__(self, config: Dict, d_expert: Optional[int] = None):
-        super().__init__()
-        self.config = config
-        self.act_fn = nn.SiLU()
-        self.d_hidden: int = config["d_hidden"]
-        self.d_expert: int = config["d_expert"] if d_expert is None else d_expert
-
-        self.W_gate = nn.Linear(self.d_hidden, self.d_expert, bias=False)
-        self.W_up = nn.Linear(self.d_hidden, self.d_expert, bias=False)
-        self.W_down = nn.Linear(self.d_expert, self.d_hidden, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.act_fn(self.W_gate(x))
-        out = self.W_down(gate * self.W_up(x))
-        return out
+from aiter.utility import fp4_utils
+from aiter.ops.shuffle import shuffle_weight
 
 
-class MoEGate(nn.Module):
-    def __init__(self, config: Dict):
-        super().__init__()
-        self.top_k: int = config["n_experts_per_token"]
-        self.num_experts: int = config["n_routed_experts"]
-        self.d_hidden: int = config["d_hidden"]
-
-        self.W_g = nn.Linear(self.d_hidden, self.num_experts, bias=False)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits = self.W_g(x)
-        scores = logits.softmax(dim=-1)
-        topk_scores, topk_indices = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
-
-        return topk_indices, topk_scores
+# ──────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────
+MXFP4_BLOCK_SIZE = 32
+PAD_ALIGN = 256
 
 
-class MoE(nn.Module):
-    def __init__(self, config: Dict):
-        super().__init__()
-        self.config = config
-        self.experts = nn.ModuleList([
-            Expert(config)
-            for _ in range(config["n_routed_experts"])
-        ])
-        self.gating_network = MoEGate(config)
-        shared_expert_dim = config["d_expert"] * config["n_shared_experts"]
-        self.shared_expert = Expert(config=config, d_expert=shared_expert_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shared_output = self.shared_expert(x)
-        expert_indices, expert_scores = self.gating_network(x)
-        batch_size, seq_len, hidden_dim = x.shape
-        orig_shape = x.shape
-        x_flat = x.view(-1, hidden_dim)
-        flat_expert_indices = expert_indices.view(-1)
-        flat_expert_weights = expert_scores.view(-1, 1)
-        routed_output_flat = self.moe_infer(x_flat,
-                                            flat_expert_indices,
-                                            flat_expert_weights)
-
-        routed_output = routed_output_flat.view(*orig_shape)
-        return routed_output + shared_output
-
-    @torch.no_grad()
-    def moe_infer(self,
-                  x: torch.Tensor,
-                  flat_expert_indices: torch.Tensor,
-                  flat_expert_weights: torch.Tensor
-                 ) -> torch.Tensor:
-        expert_cache = torch.zeros_like(x)
-        idxs = flat_expert_indices.argsort()
-        counts = flat_expert_indices.bincount().cpu().numpy()
-        tokens_per_expert = counts.cumsum()
-        num_per_tok = self.config["n_experts_per_token"]
-        token_idxs = idxs // num_per_tok
-        for expert_id, end_idx in enumerate(tokens_per_expert):
-            start_idx = 0 if expert_id == 0 else tokens_per_expert[expert_id - 1]
-            if start_idx == end_idx:
-                continue
-
-            expert = self.experts[expert_id]
-            exp_token_idxs = token_idxs[start_idx:end_idx]
-            expert_tokens = x[exp_token_idxs]
-            expert_out    = expert(expert_tokens)
-            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
-            expert_cache.scatter_reduce_(
-                0,
-                exp_token_idxs.view(-1, 1).repeat(1, x.shape[-1]),
-                expert_out,
-                reduce='sum'
-            )
-
-        return expert_cache
+def _pad_to(x: int, align: int) -> int:
+    return (x + align - 1) // align * align
 
 
+# ──────────────────────────────────────────────────────────────────────
+# ref_kernel: calls AITER fused_moe with MXFP4 quantized weights
+# ──────────────────────────────────────────────────────────────────────
 def ref_kernel(data: input_t) -> output_t:
     """
-    Reference implementation of DeepSeek-style Mixture of Experts using PyTorch.
-    
-    Args:
-        data: Tuple of (input: torch.Tensor, weights: Dict[str, torch.Tensor], config: Dict)
-            - input: Input tensor of shape [batch_size, seq_len, hidden_dim]
-            - weights: Dictionary containing model weights
-            - config: Dictionary containing model configuration parameters
-            
+    Reference implementation using AITER's fused_moe kernel with MXFP4 quantized weights.
+
+    Matches the Mxfp4MoEMethod.apply() codepath in atom/model_ops/moe.py.
+
+    Input data tuple:
+        hidden_states:                [M, d_hidden]                           bf16
+        gate_up_weight:               [E, 2*d_expert_pad, d_hidden_pad//2]    fp4x2  (raw, before shuffle)
+        down_weight:                  [E, d_hidden_pad, d_expert_pad//2]      fp4x2  (raw, before shuffle)
+        gate_up_weight_scale:         [E, 2*d_expert_pad, scale_K]            e8m0   (raw, before shuffle)
+        down_weight_scale:            [E, d_hidden_pad, scale_K]              e8m0   (raw, before shuffle)
+        gate_up_weight_shuffled:      [E, 2*d_expert_pad, d_hidden_pad//2]    fp4x2  (shuffled for CK kernel)
+        down_weight_shuffled:         [E, d_hidden_pad, d_expert_pad//2]      fp4x2  (shuffled for CK kernel)
+        gate_up_weight_scale_shuffled:[padded, flat]                          e8m0   (shuffled for CK kernel)
+        down_weight_scale_shuffled:   [padded, flat]                          e8m0   (shuffled for CK kernel)
+        topk_weights:                 [M, top_k]                              float32
+        topk_ids:                     [M, top_k]                              int32
+        config:                       dict
+
     Returns:
-        Tuple containing:
-            - output: Processed tensor [batch_size, seq_len, d_model]
-            - aux_data: Dictionary with auxiliary data
+        output: [M, d_hidden] bf16
     """
-    input_tensor, weights, config = data
-    num_experts = config["n_routed_experts"]
-    moe = MoE(config)
+    (
+        hidden_states,
+        gate_up_weight,
+        down_weight,
+        gate_up_weight_scale,
+        down_weight_scale,
+        gate_up_weight_shuffled,
+        down_weight_shuffled,
+        gate_up_weight_scale_shuffled,
+        down_weight_scale_shuffled,
+        topk_weights,
+        topk_ids,
+        config,
+    ) = data
 
-    # Fill in the given weights of the model
-    moe.gating_network.W_g.weight = nn.Parameter(weights['router.weight'])
+    hidden_pad = config["d_hidden_pad"] - config["d_hidden"]
+    intermediate_pad = config["d_expert_pad"] - config["d_expert"]
 
-    for i in range(num_experts):
-        gate_proj_weight = weights[f'experts.{i}.0.weight']
-        up_proj_weight = weights[f'experts.{i}.1.weight']
-        down_proj_weight = weights[f'experts.{i}.2.weight']
-
-        # Transpose weights to match expected shape for nn.Linear
-        moe.experts[i].W_gate.weight = nn.Parameter(gate_proj_weight.t())
-        moe.experts[i].W_up.weight = nn.Parameter(up_proj_weight.t())
-        moe.experts[i].W_down.weight = nn.Parameter(down_proj_weight.t())
-
-    moe.shared_expert.W_gate.weight = nn.Parameter(weights['shared_experts.0.weight'].t())
-    moe.shared_expert.W_up.weight = nn.Parameter(weights['shared_experts.1.weight'].t())
-    moe.shared_expert.W_down.weight = nn.Parameter(weights['shared_experts.2.weight'].t())
-
-    output = moe(input_tensor)
+    output = fused_moe(
+        hidden_states,
+        gate_up_weight_shuffled,
+        down_weight_shuffled,
+        topk_weights,
+        topk_ids,
+        expert_mask=None,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.per_1x32,  # MXFP4 uses per_1x32 block scaling
+        doweight_stage1=False,
+        w1_scale=gate_up_weight_scale_shuffled,
+        w2_scale=down_weight_scale_shuffled,
+        a1_scale=None,
+        a2_scale=None,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+    )
 
     return output
 
 
-# Input generation for the reference code
-
+# ──────────────────────────────────────────────────────────────────────
+# generate_input: produce all tensors needed by ref_kernel
+#
+# Models DeepSeek-R1 MoE layer shapes:
+#   - d_hidden = 7168
+#   - d_expert = moe_intermediate_size (full=2048, or TP-split)
+#   - E = local number of experts on this GPU
+#   - top_k = 8
+#
+# ──────────────────────────────────────────────────────────────────────
 def generate_input(
     dhidden: int,
     dexpert: int,
     nroutedexperts: int,
-    nsharedexperts: int,
     nexpertspertoken: int,
     bs: int,
-    seqlen: int,
-    seed: int
+    seed: int,
 ) -> input_t:
-
-    # Really dumb but for now _ isn't parsing correctly.
     d_hidden = dhidden
     d_expert = dexpert
     n_routed_experts = nroutedexperts
-    n_shared_experts = nsharedexperts
-    n_experts_per_token = nexpertspertoken
-    batch_size = bs
-    seq_len = seqlen
+    top_k = nexpertspertoken
+    M = bs  # number of tokens
+
+    # Padded dimensions (AITER MXFP4 requires 256-alignment)
+    d_hidden_pad = _pad_to(d_hidden, PAD_ALIGN)
+    d_expert_pad = _pad_to(d_expert, PAD_ALIGN)
 
     config = {
         "d_hidden": d_hidden,
         "d_expert": d_expert,
+        "d_hidden_pad": d_hidden_pad,
+        "d_expert_pad": d_expert_pad,
         "n_routed_experts": n_routed_experts,
-        "n_shared_experts": n_shared_experts,
-        "n_experts_per_token": n_experts_per_token,
-        "batch_size": batch_size,
-        "seq_len": seq_len,
+        "n_experts_per_token": top_k,
+        "bs": M,
     }
 
     gen = torch.Generator(device='cuda')
     gen.manual_seed(seed)
 
-    num_experts = n_routed_experts
-    expert_dim = d_expert
-    weights = {}
+    # ── hidden_states [M, d_hidden] ──
+    hidden_states = torch.randn(
+        (M, d_hidden), device='cuda', dtype=torch.bfloat16, generator=gen,
+    )
 
-    input_tensor = torch.randn(
-        (batch_size, seq_len, d_hidden),
-        device='cuda',
-        dtype=torch.float16,
-        generator=gen
-    ).contiguous()
-
-    # Initialize router weights
-    weights['router.weight'] = torch.randn(
-        (num_experts, d_hidden),
-        device="cuda",
-        dtype=torch.float16,
-        generator=gen
+    # ── Router: softmax top-k ──
+    router_weight = torch.randn(
+        (n_routed_experts, d_hidden), device='cuda', dtype=torch.bfloat16, generator=gen,
     ) / math.sqrt(d_hidden)
+    router_logits = F.linear(hidden_states, router_weight)  # [M, E]
+    scores = router_logits.softmax(dim=-1)
+    topk_weights, topk_ids = torch.topk(
+        scores, k=top_k, dim=-1, sorted=False
+    )
+    topk_weights = topk_weights.to(torch.float32)
+    topk_ids = topk_ids.to(torch.int32)
 
-    for i in range(num_experts):
-        weights[f'experts.{i}.0.weight'] = torch.randn(
-            (d_hidden, expert_dim),
-            device='cuda',
-            dtype=torch.float16,
-            generator=gen
-        ) / math.sqrt(expert_dim)
+    # ── Expert weights: bf16 -> quantize to MXFP4 ──
+    # gate_up = fused [gate_proj; up_proj] per expert: [2*d_expert_pad, d_hidden_pad]
+    # down    = down_proj                  per expert: [d_hidden_pad, d_expert_pad]
+    gate_up_q_list, gate_up_s_list = [], []
+    down_q_list, down_s_list = [], []
 
-        weights[f'experts.{i}.1.weight'] = torch.randn(
-            (d_hidden, expert_dim),
-            device='cuda',
-            dtype=torch.float16,
-            generator=gen
-        ) / math.sqrt(expert_dim)
-
-        weights[f'experts.{i}.2.weight'] = torch.randn(
-            (expert_dim, d_hidden),
-            device='cuda',
-            dtype=torch.float16,
-            generator=gen
+    for _ in range(n_routed_experts):
+        # gate_proj + up_proj -> fused [2*d_expert_pad, d_hidden_pad]
+        gate_bf16 = torch.randn(
+            (d_expert_pad, d_hidden_pad), device='cuda', dtype=torch.bfloat16, generator=gen
         ) / math.sqrt(d_hidden)
-    
-    weights['shared_experts.0.weight'] = torch.randn(
-        (d_hidden, expert_dim * n_shared_experts),
-        device='cuda',
-        dtype=torch.float16,
-        generator=gen
-    ) / math.sqrt(expert_dim * n_shared_experts)
-    weights['shared_experts.1.weight'] = torch.randn(
-        (d_hidden, expert_dim * n_shared_experts),
-        device='cuda',
-        dtype=torch.float16,
-        generator=gen
-    ) / math.sqrt(expert_dim * n_shared_experts)
-    weights['shared_experts.2.weight'] = torch.randn(
-        (expert_dim * n_shared_experts, d_hidden),
-        device='cuda',
-        dtype=torch.float16,
-        generator=gen
-    ) / math.sqrt(d_hidden)
+        up_bf16 = torch.randn(
+            (d_expert_pad, d_hidden_pad), device='cuda', dtype=torch.bfloat16, generator=gen
+        ) / math.sqrt(d_hidden)
+        gate_up_bf16 = torch.cat([gate_bf16, up_bf16], dim=0)
 
-    return (input_tensor, weights, config)
+        # down_proj -> [d_hidden_pad, d_expert_pad]
+        down_bf16 = torch.randn(
+            (d_hidden_pad, d_expert_pad), device='cuda', dtype=torch.bfloat16, generator=gen
+        ) / math.sqrt(d_expert)
+
+        # Quantize to MXFP4
+        gu_q, gu_s = fp4_utils.dynamic_mxfp4_quant(gate_up_bf16)
+        dn_q, dn_s = fp4_utils.dynamic_mxfp4_quant(down_bf16)
+
+        gate_up_q_list.append(gu_q)
+        gate_up_s_list.append(gu_s)
+        down_q_list.append(dn_q)
+        down_s_list.append(dn_s)
+
+    # Stack into [E, ...] tensors — raw (before shuffle)
+    E = n_routed_experts
+    gate_up_weight = torch.stack(gate_up_q_list)          # [E, 2*d_expert_pad, d_hidden_pad//2]  fp4x2
+    gate_up_weight_scale = torch.stack(gate_up_s_list)    # [E, 2*d_expert_pad, scale_K]          e8m0
+    down_weight = torch.stack(down_q_list)                # [E, d_hidden_pad, d_expert_pad//2]    fp4x2
+    down_weight_scale = torch.stack(down_s_list)          # [E, d_hidden_pad, scale_K]            e8m0
+
+    # Shuffle for AITER CK kernel
+    gate_up_weight_shuffled = shuffle_weight(gate_up_weight.clone())
+    down_weight_shuffled = shuffle_weight(down_weight.clone())
+    gate_up_weight_scale_shuffled = fp4_utils.e8m0_shuffle(gate_up_weight_scale.reshape(E, -1))
+    down_weight_scale_shuffled = fp4_utils.e8m0_shuffle(down_weight_scale.reshape(E, -1))
+
+    return (
+        hidden_states,                  # [M, d_hidden]                          bf16
+        gate_up_weight,                 # [E, 2*d_expert_pad, d_hidden_pad//2]   fp4x2  (raw)
+        down_weight,                    # [E, d_hidden_pad, d_expert_pad//2]     fp4x2  (raw)
+        gate_up_weight_scale,           # [E, 2*d_expert_pad, scale_K]           e8m0   (raw)
+        down_weight_scale,              # [E, d_hidden_pad, scale_K]             e8m0   (raw)
+        gate_up_weight_shuffled,        # [E, 2*d_expert_pad, d_hidden_pad//2]   fp4x2  (shuffled)
+        down_weight_shuffled,           # [E, d_hidden_pad, d_expert_pad//2]     fp4x2  (shuffled)
+        gate_up_weight_scale_shuffled,  # [padded, flat]                         e8m0   (shuffled)
+        down_weight_scale_shuffled,     # [padded, flat]                         e8m0   (shuffled)
+        topk_weights,                   # [M, top_k]                             float32
+        topk_ids,                       # [M, top_k]                             int32
+        config,
+    )
 
 
 check_implementation = make_match_reference(ref_kernel, rtol=1e-2, atol=1e-2)
