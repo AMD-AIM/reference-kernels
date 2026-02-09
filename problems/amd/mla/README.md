@@ -9,9 +9,8 @@ The absorbed query and compressed KV cache are provided directly — you impleme
 attention computation with variable-length batching.
 
 The reference uses **aiter MLA a8w8 decode kernel** (`mla_decode_fwd`, fp8 Q + fp8 KV,
-persistent mode), which is ~2-3x faster than bf16 on MI355X with negligible accuracy loss.
-
-Source: [sglang/scripts/radix_attention_standalone.py](https://github.com/sgl-project/sglang)
+persistent mode). On MI355X, a8w8 is ~2-3x faster than bf16 with negligible accuracy loss.
+The reference quantizes Q to fp8 on-the-fly and uses pre-quantized fp8 KV from `kv_data["fp8"]`.
 
 ## DeepSeek R1 Forward-Absorb MLA Config
 
@@ -24,9 +23,30 @@ Source: [sglang/scripts/radix_attention_standalone.py](https://github.com/sgl-pr
 | qk_head_dim | 576 | kv_lora_rank + qk_rope_head_dim (absorbed q/k dim) |
 | v_head_dim | 512 | = kv_lora_rank (output dim) |
 | sm_scale | 1/sqrt(576) | |
-| q dtype | bfloat16 | Always bf16 |
+| q dtype | bfloat16 | Input always bf16; reference quantizes to fp8 on-the-fly |
 | kv dtype | bf16 / fp8 / mxfp4 | All three provided simultaneously |
 | mode | decode | q_seq_len=1, kv_seq_len up to 8k |
+
+## Reference Kernel
+
+The reference (`ref_kernel`) is configurable via two globals in `reference.py`:
+
+| `Q_DTYPE` | `KV_DTYPE` | Aiter kernel dispatched | Description |
+|---|---|---|---|
+| `"fp8"` (default) | `"fp8"` (default) | `mla_a8w8_qh16_qseqlen1_gqaratio16_ps` | fp8 Q + fp8 KV — fastest |
+| `"bf16"` | `"fp8"` | `mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_ps` | bf16 Q + fp8 KV |
+| `"bf16"` | `"bf16"` | `mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_ps` | bf16 Q + bf16 KV — highest precision |
+
+**Note**: `Q_DTYPE="fp8"` + `KV_DTYPE="bf16"` is not a valid combination (no a8w16 kernel exists).
+
+### Reference Latency (MI355X)
+
+| Case | a8w8 (us) | a16w16 (us) | a8w8 speedup |
+|---|---|---|---|
+| bs=4, kv=1k | ~118 | ~162 | 1.4x |
+| bs=4, kv=8k | ~113 | ~177 | 1.6x |
+| bs=64, kv=8k | ~171 | ~353 | 2.1x |
+| bs=256, kv=8k | ~349 | ~814 | 2.3x |
 
 ## KV Buffer Format (forward_absorb)
 
@@ -59,8 +79,6 @@ The compressed KV buffer has `qk_head_dim=576` dimensions:
 - **kv_buffer**: `(total_kv, 1, 288)` in `aiter.dtypes.fp4x2` — packed FP4 data
 - **kv_scale**: `(total_kv, N_blocks)` in `aiter.dtypes.fp8_e8m0` — per-block E8M0 scale factors
 - **Dequantize**: `aiter.utility.fp4_utils.mxfp4_to_f32` + `e8m0_to_f32` for block-wise scaling
-- **Reference approach**: dequantize MXFP4 → bf16, then run bf16 MLA kernel
-- **Optimization opportunity**: fuse dequantization with attention to avoid materializing the full bf16 buffer
 
 ### aiter dtype reference
 
@@ -95,8 +113,22 @@ kv_data = {
 }
 ```
 
-The `config` dict includes: `batch_size`, `num_heads`, `num_kv_heads`, `qk_head_dim`,
-`kv_lora_rank`, `qk_rope_head_dim`, `v_head_dim`, `q_seq_len`, `kv_seq_len`, `sm_scale`.
+### config dict
+
+```python
+config = {
+    "batch_size": int,
+    "num_heads": 16,
+    "num_kv_heads": 1,
+    "qk_head_dim": 576,
+    "kv_lora_rank": 512,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 512,
+    "q_seq_len": 1,
+    "kv_seq_len": int,      # varies per test case (1024 or 8192)
+    "sm_scale": 0.04166..., # 1/sqrt(576)
+}
+```
 
 ## Output
 
@@ -106,30 +138,49 @@ attention_output: (total_q, 16, 512) bfloat16
 
 ## Optimization Opportunities
 
-1. **MQA pattern**: 1 KV head shared across 16 query heads — minimize redundant KV loads
-2. **Decode workload**: q_seq_len=1 vs large kv_seq_len (up to 8k) — memory-bound
-3. **Quantized KV cache**: We have provided 3 dtypes of kv cache returned by `generate_input`. fp8/mxfp4 reduces memory bandwidth (the key bottleneck for decode), optional strategy you might use:
+The reference is already a highly optimized aiter a8w8 persistent kernel. To beat it, consider:
 
-   **Strategy A — Fuse dequantization with attention (keep Q in bf16):**
-   The reference dequantizes fp8/mxfp4 KV cache to bf16 in a separate pass, then runs
-   bf16 MLA attention. This materializes a full bf16 KV buffer in HBM, wasting bandwidth.
-   Instead, fuse the dequant into the attention inner loop: load quantized KV tiles from
-   HBM, dequantize in registers/LDS to fp16/bf16, and immediately compute QK^T and
-   softmax·V — never writing the decompressed KV back to HBM. This eliminates the extra
-   read/write of the bf16 intermediate buffer, roughly halving the memory traffic for fp8
-   and quartering it for mxfp4 compared to the naive dequant-then-attend approach.
+1. **MXFP4 KV cache**: 4x bandwidth savings over bf16, 2x over fp8. Two strategies:
+
+   **Strategy A — Fuse dequantization with attention (keep Q in bf16/fp8):**
+   Load quantized KV tiles from HBM, dequantize in registers/LDS to bf16, and
+   immediately compute QK^T and softmax·V — never writing the decompressed KV back
+   to HBM. This eliminates the extra read/write of the bf16 intermediate buffer,
+   roughly quartering the memory traffic for mxfp4 compared to the naive
+   dequant-then-attend approach.
 
    **Strategy B — Quantize Q to match KV precision (full low-precision compute):**
-   Since Q is bf16 and KV is fp8/mxfp4, the QK^T matmul still requires mixed-precision.
-   To fully exploit low-precision matrix units (e.g. fp8 MFMA on MI355X), dynamically
-   quantize Q from bf16 → fp8 (per-tensor or per-head-row scaling), then compute QK^T
-   entirely in fp8×fp8 using MFMA instructions. For mxfp4 KV, quantize Q to mxfp4 as
-   well to use fp4×fp4 MFMA. The softmax is still done in fp32 for numerical stability,
-   and V accumulation can use fp8×fp8 → fp32 or bf16 for the output. This trades a small
-   amount of accuracy (from quantizing Q) for significantly higher throughput on the
-   matrix units, which matters when batch sizes are large enough to become compute-bound.
-4. **Variable-length batching**: indptr-based segmented attention across batch
-5. **Split K/V from buffer**: full 576 dims for keys, first 512 for values
+   Dynamically quantize Q from bf16 → mxfp4 (per-block scaling), then compute QK^T
+   entirely in fp4×fp4 using MFMA instructions on MI355X. The softmax is still done
+   in fp32 for numerical stability, and V accumulation uses fp4×fp4 → fp32. This
+   trades a small amount of accuracy for significantly higher throughput on the
+   matrix units.
+
+2. **Custom split-K / split-batch scheduling**: the aiter kernel uses 32-way KV splits
+   with reduce; a different split strategy or tile size may be more efficient for certain
+   batch/seq_len combinations.
+
+3. **MQA pattern**: 1 KV head shared across 16 query heads — minimize redundant KV loads
+   by loading KV once and broadcasting across all query heads in shared memory/LDS.
+
+4. **Variable-length batching**: indptr-based segmented attention across batch elements.
+
+5. **Split K/V from buffer**: full 576 dims for keys, first 512 for values — potential
+   for separate tiling strategies for the score and output stages.
+
+## Accuracy
+
+Submissions are checked against the a8w8 reference with `rtol=2e-02, atol=8e-03`.
+
+Measured accuracy of different approaches vs bf16 torch ground truth:
+
+| Approach | max abs diff | Notes |
+|---|---|---|
+| aiter a8w8 (reference) | 2.6e-05 — 8.0e-05 | fp8 quantization + kernel accumulation |
+| torch fp8 (scaled_mm) | 2e-06 — 1.5e-05 | Closest to bf16 |
+| torch mxfp4 | 2.1e-04 — 8.3e-04 | 4-bit quantization noise |
+
+All approaches are well within the tolerance.
 
 ## Benchmark Cases
 
@@ -139,8 +190,11 @@ All three KV formats (bf16, fp8, mxfp4) are provided in every test case.
 |---|---|---|
 | 4 | 1 | 1024 |
 | 4 | 1 | 8192 |
-
+| 32 | 1 | 1024 |
+| 32 | 1 | 8192 |
 | 64 | 1 | 1024 |
 | 64 | 1 | 8192 |
 | 256 | 1 | 1024 |
 | 256 | 1 | 8192 |
+
+Ranking is by **geometric mean** of benchmark latencies.
