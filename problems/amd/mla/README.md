@@ -8,8 +8,8 @@ This is the **inner attention kernel** from DeepSeek R1's `forward_absorb` MLA p
 The absorbed query and compressed KV cache are provided directly — you implement the
 attention computation with variable-length batching.
 
-The reference uses **aiter MLA bf16 decode kernel** (`mla_decode_fwd`, persistent mode)
-for highest precision.
+The reference uses **aiter MLA a8w8 decode kernel** (`mla_decode_fwd`, fp8 Q + fp8 KV,
+persistent mode), which is ~2-3x faster than bf16 on MI355X with negligible accuracy loss.
 
 Source: [sglang/scripts/radix_attention_standalone.py](https://github.com/sgl-project/sglang)
 

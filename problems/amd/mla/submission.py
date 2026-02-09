@@ -1,7 +1,7 @@
 """
 MLA (Multi-head Latent Attention) decode kernel — submission template.
 
-Implement custom_kernel() to beat the aiter reference.
+Implement custom_kernel() to beat the aiter a8w8 reference (fp8 Q + fp8 KV).
 
 DeepSeek R1 forward_absorb MLA config:
   num_heads        = 16     (query heads, after TP split)
@@ -29,12 +29,12 @@ Input tuple:
 Output:
   attention output: (total_q, 16, 512) bfloat16
 
-Key optimization opportunities:
-  1. Use fp8 or mxfp4 KV cache to reduce memory bandwidth (decode is memory-bound)
-     - fp8: aiter supports bf16-Q + fp8-KV (a16w8) persistent MLA kernel natively
-     - mxfp4: fuse dequantization + attention to skip bf16 materialization
-  2. MQA: 1 KV head shared across 16 query heads — minimize redundant memory loads
-  3. Decode: small q_seq_len (1) vs large kv_seq_len (up to 8k) — memory-bound
+The reference uses aiter's a8w8 persistent MLA kernel (fp8 Q + fp8 KV),
+which is ~2-3x faster than bf16. To beat it, consider:
+  1. Use mxfp4 KV cache for even lower memory bandwidth
+     - Fuse dequantization with attention to avoid bf16 materialization
+  2. Custom kernel with tighter memory access patterns
+  3. MQA: 1 KV head shared across 16 query heads — minimize redundant memory loads
   4. Variable-length batching: indptr-based segmented attention
   5. Split K/V from buffer: full 576 dims for keys, first 512 dims for values
 """

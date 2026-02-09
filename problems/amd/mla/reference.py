@@ -5,15 +5,16 @@ Uses aiter MLA kernels (mla_decode_fwd) as the reference.
 DeepSeek R1 forward_absorb MLA: absorbed q (576), compressed kv_buffer (576),
 output v_head_dim = kv_lora_rank = 512.
 
-The input provides KV cache in three formats via kv_data dict:
-  kv_data = {
+The input provides:
+  q:       (total_q, 16, 576) bfloat16 — absorbed query
+  kv_data: dict with KV cache in three formats:
     "bf16":  Tensor  (total_kv, 1, 576)  bfloat16          — highest precision
     "fp8":   (Tensor, Tensor)  kv_buffer fp8 + scalar scale — per-tensor quantized
     "mxfp4": (Tensor, Tensor)  kv_buffer fp4x2 + fp8_e8m0  — block-32 quantized
-  }
+  The reference quantizes Q to fp8 on-the-fly inside ref_kernel.
 
-The reference kernel uses bf16 KV cache for highest accuracy.
-Participants are free to use fp8 or mxfp4 KV buffers for better performance.
+The reference kernel quantizes Q to fp8 on-the-fly and uses fp8 KV (a8w8 kernel),
+which is ~2-3x faster than bf16 on MI355X with negligible accuracy loss.
 
 Decode only — persistent mode with get_mla_metadata_v1.
 """
@@ -49,6 +50,12 @@ NUM_KV_SPLITS = 32
 
 # FP8 dtype (platform-specific via aiter)
 FP8_DTYPE = aiter_dtypes.fp8
+
+# Query dtype for the reference kernel: "fp8" or "bf16"
+Q_DTYPE = "fp8"
+
+# KV cache dtype for the reference kernel: "fp8" or "bf16"
+KV_DTYPE = "fp8"
 
 
 # ---------------------------------------------------------------------------
@@ -212,16 +219,20 @@ def _aiter_mla_decode(
     qo_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     config: dict,
+    q_scale: torch.Tensor | None = None,
+    kv_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     MLA decode attention using aiter persistent-mode kernel.
 
-    Uses bf16 KV cache for highest precision reference.
-    The aiter persistent kernel also supports bf16-Q + fp8-KV (a16w8) natively,
-    but the reference always uses bf16 for accuracy.
+    Supports multiple Q/KV dtype combinations:
+      - Q_DTYPE="fp8":  fp8 Q + fp8 KV (a8w8) — fastest on MI355X
+      - Q_DTYPE="bf16": bf16 Q + bf16 KV (a16w16) — highest precision
 
-    q:          (total_q, num_heads, 576)  bf16
-    kv_buffer:  (total_kv, 1, 576)         bfloat16
+    q:          (total_q, num_heads, 576)  fp8 or bf16
+    kv_buffer:  (total_kv, 1, 576)         fp8 or bf16
+    q_scale:    scalar float32 (required for fp8 Q, None for bf16)
+    kv_scale:   scalar float32 (required for fp8 KV, None for bf16)
     """
     batch_size = config["batch_size"]
     nq = config["num_heads"]
@@ -230,17 +241,10 @@ def _aiter_mla_decode(
     dv = config["v_head_dim"]
     q_seq_len = config["q_seq_len"]
 
-    # --- Reference always uses bf16 KV for highest accuracy ---
-    # Participants can use fp8/mxfp4 KV from kv_data for better performance:
-    #   kv_data["fp8"]   = (kv_buffer_fp8, kv_scale_fp8)     — aiter a16w8 kernel
-    #   kv_data["mxfp4"] = (kv_buffer_mxfp4, kv_scale_mxfp4) — fuse dequant + attention
-    kv_scale = None
-    actual_kv_torch_dtype = torch.bfloat16
-
     total_kv_len = int(kv_indptr[-1].item())
     kv_indices = torch.arange(total_kv_len, dtype=torch.int32, device="cuda")
 
-    # Reshape kv_buffer to 4D for aiter: (total_kv, page_size=1, nhead_kv=1, dim)
+    # Reshape kv_buffer to 4D for aiter: (total_kv, page_size, nhead_kv, dim)
     kv_buffer_4d = kv_buffer.view(kv_buffer.shape[0], PAGE_SIZE, nkv, kv_buffer.shape[-1])
 
     max_q_len = q_seq_len
@@ -249,7 +253,7 @@ def _aiter_mla_decode(
     # Build persistent-mode metadata
     meta = _make_mla_decode_metadata(
         batch_size, max_q_len, nq, nkv,
-        q.dtype, actual_kv_torch_dtype,
+        q.dtype, kv_buffer.dtype,
         qo_indptr, kv_indptr, kv_last_page_len,
         num_kv_splits=NUM_KV_SPLITS,
     )
@@ -269,6 +273,7 @@ def _aiter_mla_decode(
         sm_scale=SM_SCALE,
         logit_cap=0.0,
         num_kv_splits=NUM_KV_SPLITS,
+        q_scale=q_scale,
         kv_scale=kv_scale,
         intra_batch_mode=True,
         **meta,
@@ -309,10 +314,10 @@ def generate_input(batchsize: int, qseqlen: int, kvseqlen: int, seed: int) -> in
         dtype=torch.bfloat16, device="cuda", generator=gen,
     ) * 0.02
 
-    # Quantize to fp8
+    # Quantize KV to fp8
     kv_buffer_fp8, kv_scale_fp8 = quantize_fp8(kv_buffer_bf16)
 
-    # Quantize to mxfp4
+    # Quantize KV to mxfp4
     kv_buffer_mxfp4, kv_scale_mxfp4 = quantize_mxfp4(kv_buffer_bf16)
 
     # All three KV formats: bf16 is a Tensor, fp8/mxfp4 are (Tensor, Tensor) tuples
@@ -342,13 +347,26 @@ def generate_input(batchsize: int, qseqlen: int, kvseqlen: int, seed: int) -> in
 
 
 def ref_kernel(data: input_t) -> output_t:
-    """Reference MLA attention using aiter bf16 decode kernel (highest precision)."""
+    """Reference MLA decode attention. Uses Q_DTYPE and KV_DTYPE to select kernel variant."""
     q, kv_data, qo_indptr, kv_indptr, config = data
-    kv_buffer = kv_data["bf16"]
-    # TODO: use fp8 and mxfp4 if better performance is achieved.
-    # kv_buffer = kv_data["fp8"]
-    # kv_buffer = kv_data["mxfp4"]
-    return _aiter_mla_decode(q, kv_buffer, qo_indptr, kv_indptr, config)
+
+    # Resolve Q
+    if Q_DTYPE == "fp8":
+        q_input, q_scale = quantize_fp8(q)
+    else:
+        q_input, q_scale = q, None
+
+    # Resolve KV
+    if KV_DTYPE == "fp8":
+        kv_buffer_fp8, kv_scale = kv_data["fp8"]
+        kv_input = kv_buffer_fp8
+    else:
+        kv_input, kv_scale = kv_data["bf16"], None
+
+    return _aiter_mla_decode(
+        q_input, kv_input, qo_indptr, kv_indptr, config,
+        q_scale=q_scale, kv_scale=kv_scale,
+    )
 
 
 check_implementation = make_match_reference(ref_kernel, rtol=2e-02, atol=8e-03)
