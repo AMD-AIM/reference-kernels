@@ -117,7 +117,7 @@ def generate_input(
     down_weight = torch.stack(down_q_list)                # [E, d_hidden_pad, d_expert_pad//2]    fp4x2
     down_weight_scale = torch.stack(down_s_list)          # [E, d_hidden_pad, scale_K]            e8m0
 
-    # Shuffle for AITER CK kernel
+    # Pre-shuffled weight. You can also shuffle the weights yourself before calling the kernel.
     gate_up_weight_shuffled = shuffle_weight(gate_up_weight.clone())
     down_weight_shuffled = shuffle_weight(down_weight.clone())
     gate_up_weight_scale_shuffled = fp4_utils.e8m0_shuffle(gate_up_weight_scale.reshape(E, -1))
@@ -129,10 +129,10 @@ def generate_input(
         down_weight,                    # [E, d_hidden_pad, d_expert_pad//2]     fp4x2  (raw)
         gate_up_weight_scale,           # [E, 2*d_expert_pad, scale_K]           e8m0   (raw)
         down_weight_scale,              # [E, d_hidden_pad, scale_K]             e8m0   (raw)
-        gate_up_weight_shuffled,        # [E, 2*d_expert_pad, d_hidden_pad//2]   fp4x2  (shuffled)
-        down_weight_shuffled,           # [E, d_hidden_pad, d_expert_pad//2]     fp4x2  (shuffled)
-        gate_up_weight_scale_shuffled,  # [padded, flat]                         e8m0   (shuffled)
-        down_weight_scale_shuffled,     # [padded, flat]                         e8m0   (shuffled)
+        gate_up_weight_shuffled,        # [E, 2*d_expert_pad, d_hidden_pad//2]   fp4x2  (pre-shuffled)
+        down_weight_shuffled,           # [E, d_hidden_pad, d_expert_pad//2]     fp4x2  (pre-shuffled)
+        gate_up_weight_scale_shuffled,  # [padded, flat]                         e8m0   (pre-shuffled)
+        down_weight_scale_shuffled,     # [padded, flat]                         e8m0   (pre-shuffled)
         topk_weights,                   # [M, top_k]                             float32
         topk_ids,                       # [M, top_k]                             int32
         config,
