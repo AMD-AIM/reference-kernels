@@ -20,27 +20,27 @@ description: |
     5. Weighted sum of expert outputs
 
   All expert weights (W_gate, W_up, W_down) are in MXFP4 format with e8m0 block scales (block_size=32).
-  The W_gate and W_up are fused into a single w13 weight. Weights are pre-shuffled for CK kernel layout.
+  The W_gate and W_up are fused into a single gate_up weight. Both raw and pre-shuffled (for CK kernel layout)
+  versions of all weights and scales are provided.
 
   DeepSeek-R1 MoE specs:
     - hidden_size = 7168, moe_intermediate_size = 2048
     - 256 routed experts, top-8 routing
     - 58 MoE layers (layer 3-60)
 
-  Three deployment scenarios (TP=8):
-    - bs=4:   decode, all 256 experts local, intermediate TP-split to 256
-    - bs=64:  EP=8, 32 experts per GPU, full intermediate=2048
-    - bs=256: EP=8, 32 experts per GPU, full intermediate=2048
-
   Input:
-    - hidden_states:    [M, 7168]                    bf16
-    - w13_weight:       [E, 2*d_expert_pad, 3584]    fp4x2 (shuffled)
-    - w2_weight:        [E, 7168, d_expert_pad//2]   fp4x2 (shuffled)
-    - w13_weight_scale: shuffled e8m0 block scales
-    - w2_weight_scale:  shuffled e8m0 block scales
-    - topk_weights:     [M, 8]                       float32
-    - topk_ids:         [M, 8]                       int32
-    - config:           dict with dimensions
+    - hidden_states:                  [M, d_hidden]                          bf16
+    - gate_up_weight:                 [E, 2*d_expert_pad, d_hidden_pad//2]   fp4x2 (raw)
+    - down_weight:                    [E, d_hidden_pad, d_expert_pad//2]     fp4x2 (raw)
+    - gate_up_weight_scale:           [E, 2*d_expert_pad, d_hidden_pad//32]  e8m0  (raw)
+    - down_weight_scale:              [E, d_hidden_pad, d_expert_pad//32]    e8m0  (raw)
+    - gate_up_weight_shuffled:        [E, 2*d_expert_pad, d_hidden_pad//2]   fp4x2 (shuffled for CK)
+    - down_weight_shuffled:           [E, d_hidden_pad, d_expert_pad//2]     fp4x2 (shuffled for CK)
+    - gate_up_weight_scale_shuffled:  [padded, flat]                         e8m0  (shuffled for CK)
+    - down_weight_scale_shuffled:     [padded, flat]                         e8m0  (shuffled for CK)
+    - topk_weights:                   [M, top_k]                             float32
+    - topk_ids:                       [M, top_k]                             int32
+    - config:                         dict with dimensions
 
   Output:
     - output: [M, 7168] bf16
