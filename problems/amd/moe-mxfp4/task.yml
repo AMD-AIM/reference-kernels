@@ -12,12 +12,25 @@ lang: "py"
 description: |
   Implement a DeepSeek-R1 style MXFP4 Mixture of Experts (MoE) fused kernel on MI355X.
 
-  The fused_moe kernel performs the following for each token:
-    1. Route token to top-k experts based on pre-computed routing weights
-    2. For each active expert, compute: gate_proj = SiLU(x @ W_gate), up_proj = x @ W_up
-    3. Compute intermediate = gate_proj * up_proj (SwiGLU-style)
-    4. Compute output = intermediate @ W_down
-    5. Weighted sum of expert outputs
+  The fused_moe kernel performs the following:
+
+    Given M tokens, each routed to top_k experts with pre-computed weights:
+
+    For each token i and its assigned expert j (with routing weight w_ij):
+      1. Stage 1 (gate_up GEMM + activation):
+         - gate = x_i @ W_gate_j.T                      # [d_hidden] x [d_expert, d_hidden].T -> [d_expert]
+         - up   = x_i @ W_up_j.T                        # [d_hidden] x [d_expert, d_hidden].T -> [d_expert]
+         - intermediate = SiLU(gate) * up                # element-wise SwiGLU activation, -> [d_expert]
+         (W_gate and W_up are fused as gate_up_weight so this is a single GEMM + fused activation)
+
+      2. Stage 2 (down GEMM):
+         - expert_out = intermediate @ W_down_j.T        # [d_expert] x [d_hidden, d_expert].T -> [d_hidden]
+
+      3. Weighted reduction:
+         - output_i += w_ij * expert_out                 # accumulate across top_k experts
+
+    All GEMMs use MXFP4 quantized weights (fp4x2 data + e8m0 block scales, block_size=32).
+    The AITER CK kernel fuses all of the above into a 2-stage pipeline across all tokens and experts.
 
   All expert weights (W_gate, W_up, W_down) are in MXFP4 format with e8m0 block scales (block_size=32).
   The W_gate and W_up are fused into a single gate_up weight. Both raw and pre-shuffled (for CK kernel layout)
