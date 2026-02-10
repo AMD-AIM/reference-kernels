@@ -229,8 +229,8 @@ def _run_single_benchmark(test: TestCase, recheck: bool, max_repeats: int, max_t
             data = generate_input(**test.args)
             check_copy = _clone_data(data)
         torch.cuda.synchronize()
-        for i in range(2): # totally eliminate the host time.
-            clear_l2_cache()
+        clear_l2_cache()
+        clear_l2_cache()
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
