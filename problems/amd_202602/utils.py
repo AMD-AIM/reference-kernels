@@ -141,3 +141,7 @@ def make_match_reference(reference: callable, **kwargs):
     def wrapped(data, output):
         return match_reference(data, output, reference=reference, **kwargs)
     return wrapped
+
+def clear_l2_cache_large():
+    dummy = torch.randn((16000, 1024, 1024), device="cuda")
+    del dummy
