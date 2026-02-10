@@ -157,69 +157,35 @@ def generate_input(
     )
 
 
+
+
 # ──────────────────────────────────────────────────────────────────────
-# ref_kernel: calls AITER fused_moe with MXFP4 quantized weights
+# ref_kernel_pytorch: pure PyTorch implementation (dequant + matmul)
 # ──────────────────────────────────────────────────────────────────────
-def ref_kernel(data: input_t) -> output_t:
+def _dequant_mxfp4(weight_fp4, scale_e8m0):
     """
-    Reference implementation using AITER's fused_moe kernel with MXFP4 quantized weights.
+    Dequantize MXFP4 weight to float32.
 
-    Input data tuple (E = n_routed_experts + n_shared_experts, total_top_k = routed + shared):
-        hidden_states:                [M, d_hidden]                           bf16
-        gate_up_weight:               [E, 2*d_expert_pad, d_hidden_pad//2]    fp4x2  (raw, before shuffle)
-        down_weight:                  [E, d_hidden_pad, d_expert_pad//2]      fp4x2  (raw, before shuffle)
-        gate_up_weight_scale:         [E, 2*d_expert_pad, scale_K]            e8m0   (raw, before shuffle)
-        down_weight_scale:            [E, d_hidden_pad, scale_K]              e8m0   (raw, before shuffle)
-        gate_up_weight_shuffled:      [E, 2*d_expert_pad, d_hidden_pad//2]    fp4x2  (pre-shuffled)
-        down_weight_shuffled:         [E, d_hidden_pad, d_expert_pad//2]      fp4x2  (pre-shuffled)
-        gate_up_weight_scale_shuffled:[padded, flat]                          e8m0   (pre-shuffled)
-        down_weight_scale_shuffled:   [padded, flat]                          e8m0   (pre-shuffled)
-        topk_weights:                 [M, total_top_k]                        float32
-        topk_ids:                     [M, total_top_k]                        int32
-        config:                       dict
+    weight_fp4:  [N, K//2]  fp4x2  (raw, not shuffled)
+    scale_e8m0:  [padded_N, ceil(K/32)] e8m0   (M-dim padded to 256-align by dynamic_mxfp4_quant)
 
-    Returns:
-        output: [M, d_hidden] bf16
+    Returns: [N, K] float32
     """
-    (
-        hidden_states,
-        gate_up_weight,
-        down_weight,
-        gate_up_weight_scale,
-        down_weight_scale,
-        gate_up_weight_shuffled,
-        down_weight_shuffled,
-        gate_up_weight_scale_shuffled,
-        down_weight_scale_shuffled,
-        topk_weights,
-        topk_ids,
-        config,
-    ) = data
+    # fp4x2 -> float32 lookup: [N, K]
+    w_f32 = fp4_utils.mxfp4_to_f32(weight_fp4)            # [N, K]
+    # e8m0 -> float32 power-of-2 scale: [padded_N, scale_K]
+    s_f32 = fp4_utils.e8m0_to_f32(scale_e8m0)             # [padded_N, scale_K]
+    N, K = w_f32.shape
+    # Trim scale rows to match weight rows (scale M-dim is padded to 256)
+    s_f32 = s_f32[:N, :]
+    # Broadcast scale across block_size=32 columns
+    s_f32 = s_f32.repeat_interleave(MXFP4_BLOCK_SIZE, dim=-1)[:, :K]  # [N, K]
+    return w_f32 * s_f32
 
-    hidden_pad = config["d_hidden_pad"] - config["d_hidden"]
-    intermediate_pad = config["d_expert_pad"] - config["d_expert"]
-
-    output = fused_moe(
-        hidden_states,
-        gate_up_weight_shuffled,
-        down_weight_shuffled,
-        topk_weights,
-        topk_ids,
-        expert_mask=None,
-        activation=ActivationType.Silu,
-        quant_type=QuantType.per_1x32,  # MXFP4 uses per_1x32 block scaling
-        doweight_stage1=False,
-        w1_scale=gate_up_weight_scale_shuffled,
-        w2_scale=down_weight_scale_shuffled,
-        a1_scale=None,
-        a2_scale=None,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-    )
-
-    return output
-
+# ──────────────────────────────────────────────────────────────────────
+# ref_kernel_pytorch: pure PyTorch implementation (dequant + matmul)
 # will not run. only for reference
+# ──────────────────────────────────────────────────────────────────────
 def ref_kernel_pytorch(data: input_t) -> output_t:
     """
     Pure PyTorch reference: dequantize MXFP4 weights -> bf16 matmul -> SwiGLU -> matmul.
@@ -291,28 +257,66 @@ def ref_kernel_pytorch(data: input_t) -> output_t:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# ref_kernel_pytorch: pure PyTorch implementation (dequant + matmul)
+# ref_kernel: calls AITER fused_moe with MXFP4 quantized weights
 # ──────────────────────────────────────────────────────────────────────
-def _dequant_mxfp4(weight_fp4, scale_e8m0):
+def ref_kernel(data: input_t) -> output_t:
     """
-    Dequantize MXFP4 weight to float32.
+    Reference implementation using AITER's fused_moe kernel with MXFP4 quantized weights.
 
-    weight_fp4:  [N, K//2]  fp4x2  (raw, not shuffled)
-    scale_e8m0:  [padded_N, ceil(K/32)] e8m0   (M-dim padded to 256-align by dynamic_mxfp4_quant)
+    Input data tuple (E = n_routed_experts + n_shared_experts, total_top_k = routed + shared):
+        hidden_states:                [M, d_hidden]                           bf16
+        gate_up_weight:               [E, 2*d_expert_pad, d_hidden_pad//2]    fp4x2  (raw, before shuffle)
+        down_weight:                  [E, d_hidden_pad, d_expert_pad//2]      fp4x2  (raw, before shuffle)
+        gate_up_weight_scale:         [E, 2*d_expert_pad, scale_K]            e8m0   (raw, before shuffle)
+        down_weight_scale:            [E, d_hidden_pad, scale_K]              e8m0   (raw, before shuffle)
+        gate_up_weight_shuffled:      [E, 2*d_expert_pad, d_hidden_pad//2]    fp4x2  (pre-shuffled)
+        down_weight_shuffled:         [E, d_hidden_pad, d_expert_pad//2]      fp4x2  (pre-shuffled)
+        gate_up_weight_scale_shuffled:[padded, flat]                          e8m0   (pre-shuffled)
+        down_weight_scale_shuffled:   [padded, flat]                          e8m0   (pre-shuffled)
+        topk_weights:                 [M, total_top_k]                        float32
+        topk_ids:                     [M, total_top_k]                        int32
+        config:                       dict
 
-    Returns: [N, K] float32
+    Returns:
+        output: [M, d_hidden] bf16
     """
-    # fp4x2 -> float32 lookup: [N, K]
-    w_f32 = fp4_utils.mxfp4_to_f32(weight_fp4)            # [N, K]
-    # e8m0 -> float32 power-of-2 scale: [padded_N, scale_K]
-    s_f32 = fp4_utils.e8m0_to_f32(scale_e8m0)             # [padded_N, scale_K]
-    N, K = w_f32.shape
-    # Trim scale rows to match weight rows (scale M-dim is padded to 256)
-    s_f32 = s_f32[:N, :]
-    # Broadcast scale across block_size=32 columns
-    s_f32 = s_f32.repeat_interleave(MXFP4_BLOCK_SIZE, dim=-1)[:, :K]  # [N, K]
-    return w_f32 * s_f32
+    (
+        hidden_states,
+        gate_up_weight,
+        down_weight,
+        gate_up_weight_scale,
+        down_weight_scale,
+        gate_up_weight_shuffled,
+        down_weight_shuffled,
+        gate_up_weight_scale_shuffled,
+        down_weight_scale_shuffled,
+        topk_weights,
+        topk_ids,
+        config,
+    ) = data
 
+    hidden_pad = config["d_hidden_pad"] - config["d_hidden"]
+    intermediate_pad = config["d_expert_pad"] - config["d_expert"]
+
+    output = fused_moe(
+        hidden_states,
+        gate_up_weight_shuffled,
+        down_weight_shuffled,
+        topk_weights,
+        topk_ids,
+        expert_mask=None,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.per_1x32,  # MXFP4 uses per_1x32 block scaling
+        doweight_stage1=False,
+        w1_scale=gate_up_weight_scale_shuffled,
+        w2_scale=down_weight_scale_shuffled,
+        a1_scale=None,
+        a2_scale=None,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+    )
+
+    return output
 
 
 
