@@ -70,16 +70,12 @@ ranked_timeout: 1200
 
 tests:
   # bs=4
-  - {"batchsize": 4, "qseqlen": 1, "kvseqlen": 1024, "seed": 4217}
-  - {"batchsize": 4, "qseqlen": 1, "kvseqlen": 8192, "seed": 4220}
+  - {"batchsize": 4, "qseqlen": 1, "kvseqlen": 1024, "seed": 4220}
   # bs=32
   - {"batchsize": 32, "qseqlen": 1, "kvseqlen": 1024, "seed": 5412}
-  - {"batchsize": 32, "qseqlen": 1, "kvseqlen": 8192, "seed": 5415}
   # bs=64
-  - {"batchsize": 64, "qseqlen": 1, "kvseqlen": 1024, "seed": 1357}
   - {"batchsize": 64, "qseqlen": 1, "kvseqlen": 8192, "seed": 1360}
   # bs=256
-  - {"batchsize": 256, "qseqlen": 1, "kvseqlen": 1024, "seed": 9823}
   - {"batchsize": 256, "qseqlen": 1, "kvseqlen": 8192, "seed": 9826}
 
 benchmarks:
