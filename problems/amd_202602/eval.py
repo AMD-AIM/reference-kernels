@@ -230,7 +230,6 @@ def _run_single_benchmark(test: TestCase, recheck: bool, max_repeats: int, max_t
             check_copy = _clone_data(data)
         torch.cuda.synchronize()
         clear_l2_cache()
-        clear_l2_cache()
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
