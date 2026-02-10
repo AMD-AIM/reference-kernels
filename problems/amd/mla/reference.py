@@ -1,27 +1,30 @@
 """
 Reference implementation for MLA (Multi-head Latent Attention) decode kernel.
 
-Uses aiter MLA kernels (mla_decode_fwd / mla_prefill_fwd) as the reference.
+Uses aiter MLA kernels (mla_decode_fwd) as the reference.
 DeepSeek R1 forward_absorb MLA: absorbed q (576), compressed kv_buffer (576),
 output v_head_dim = kv_lora_rank = 512.
 
-KV cache dtype options:
-  - bf16:  bfloat16, no scale — directly used by bf16 MLA kernel
-  - fp8:   dynamic per-tensor quantization (sglang scaled_fp8_quant style),
-           scalar kv_scale — passed to bf16-Q + fp8-KV persistent MLA kernel
-  - mxfp4: block-32 MXFP4 quantization (aiter dynamic_mxfp4_quant),
-           kv_buffer in fp4x2 dtype + kv_scale in fp8_e8m0 dtype
-           → dequantized to bf16 first, then bf16 MLA kernel is used
+The input provides:
+  q:       (total_q, 16, 576) bfloat16 — absorbed query
+  kv_data: dict with KV cache in three formats:
+    "bf16":  Tensor  (total_kv, 1, 576)  bfloat16          — highest precision
+    "fp8":   (Tensor, Tensor)  kv_buffer fp8 + scalar scale — per-tensor quantized
+    "mxfp4": (Tensor, Tensor)  kv_buffer fp4x2 + fp8_e8m0  — block-32 quantized
+  The reference quantizes Q to fp8 on-the-fly inside ref_kernel.
 
-Decode uses persistent mode; prefill uses non-persistent mode.
+The reference kernel quantizes Q to fp8 on-the-fly and uses fp8 KV (a8w8 kernel),
+which is ~2-3x faster than bf16 on MI355X with negligible accuracy loss.
+
+Decode only — persistent mode with get_mla_metadata_v1.
 """
 
 import torch
 import torch.nn.functional as F
 from task import input_t, output_t
-from utils import match_reference
+from utils import make_match_reference
 
-from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+from aiter.mla import mla_decode_fwd
 from aiter import dtypes as aiter_dtypes
 from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.utility.fp4_utils import (
@@ -48,12 +51,11 @@ NUM_KV_SPLITS = 32
 # FP8 dtype (platform-specific via aiter)
 FP8_DTYPE = aiter_dtypes.fp8
 
-# Tolerance per kv dtype
-TOLERANCES = {
-    "bf16":  {"rtol": 2e-02, "atol": 8e-03},
-    "fp8":   {"rtol": 5e-02, "atol": 1e-02},
-    "mxfp4": {"rtol": 1e-01, "atol": 5e-02},
-}
+# Query dtype for the reference kernel: "fp8" or "bf16"
+Q_DTYPE = "fp8"
+
+# KV cache dtype for the reference kernel: "fp8" or "bf16"
+KV_DTYPE = "fp8"
 
 
 # ---------------------------------------------------------------------------
@@ -208,30 +210,29 @@ def _make_mla_decode_metadata(
 
 
 # ---------------------------------------------------------------------------
-# Aiter reference kernel
+# Aiter reference kernel (decode only)
 # ---------------------------------------------------------------------------
 
-def _aiter_mla_attention(
+def _aiter_mla_decode(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
     qo_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     config: dict,
+    q_scale: torch.Tensor | None = None,
+    kv_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    MLA attention using aiter kernels (forward_absorb style).
+    MLA decode attention using aiter persistent-mode kernel.
 
-    Decode: persistent mode with get_mla_metadata_v1.
-      - bf16:  bf16 MLA kernel directly
-      - fp8:   bf16-Q + fp8-KV kernel (a16w8), kv_scale passed through
-      - mxfp4: dequantize to bf16 first, then bf16 MLA kernel
+    Supports multiple Q/KV dtype combinations:
+      - Q_DTYPE="fp8":  fp8 Q + fp8 KV (a8w8) — fastest on MI355X
+      - Q_DTYPE="bf16": bf16 Q + bf16 KV (a16w16) — highest precision
 
-    Prefill: non-persistent mode (bf16 only).
-
-    q:          (total_q, num_heads, 576)  bf16
-    kv_buffer:  bf16:  (total_kv, 1, 576)  bfloat16
-                fp8:   (total_kv, 1, 576)  fp8 dtype
-                mxfp4: (total_kv, 1, 288)  fp4x2 dtype (packed 2 fp4 per byte)
+    q:          (total_q, num_heads, 576)  fp8 or bf16
+    kv_buffer:  (total_kv, 1, 576)         fp8 or bf16
+    q_scale:    scalar float32 (required for fp8 Q, None for bf16)
+    kv_scale:   scalar float32 (required for fp8 KV, None for bf16)
     """
     batch_size = config["batch_size"]
     nq = config["num_heads"]
@@ -239,96 +240,61 @@ def _aiter_mla_attention(
     dq = config["qk_head_dim"]
     dv = config["v_head_dim"]
     q_seq_len = config["q_seq_len"]
-    kv_dtype = config.get("kv_dtype", "bf16")
-    kv_scale = config.get("kv_scale")
-
-    # For mxfp4: dequantize to bf16 first, then use bf16 MLA kernel
-    if kv_dtype == "mxfp4":
-        kv_buffer = dequantize_mxfp4(
-            kv_buffer, kv_scale,
-            orig_shape=(kv_buffer.shape[0], kv_buffer.shape[1], dq),
-        )
-        kv_scale = None
-        actual_kv_torch_dtype = torch.bfloat16
-    elif kv_dtype == "fp8":
-        actual_kv_torch_dtype = FP8_DTYPE
-    else:
-        actual_kv_torch_dtype = torch.bfloat16
 
     total_kv_len = int(kv_indptr[-1].item())
     kv_indices = torch.arange(total_kv_len, dtype=torch.int32, device="cuda")
 
-    # Reshape kv_buffer to 4D for aiter: (total_kv, page_size=1, nhead_kv=1, dim)
+    # Reshape kv_buffer to 4D for aiter: (total_kv, page_size, nhead_kv, dim)
     kv_buffer_4d = kv_buffer.view(kv_buffer.shape[0], PAGE_SIZE, nkv, kv_buffer.shape[-1])
 
-    is_decode = q_seq_len <= 4
+    max_q_len = q_seq_len
+    kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
 
-    if is_decode:
-        max_q_len = q_seq_len
-        kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
+    # Build persistent-mode metadata
+    meta = _make_mla_decode_metadata(
+        batch_size, max_q_len, nq, nkv,
+        q.dtype, kv_buffer.dtype,
+        qo_indptr, kv_indptr, kv_last_page_len,
+        num_kv_splits=NUM_KV_SPLITS,
+    )
 
-        # Build persistent-mode metadata
-        meta = _make_mla_decode_metadata(
-            batch_size, max_q_len, nq, nkv,
-            q.dtype, actual_kv_torch_dtype,
-            qo_indptr, kv_indptr, kv_last_page_len,
-            num_kv_splits=NUM_KV_SPLITS,
-        )
-
-        o = torch.empty((q.shape[0], nq, dv), dtype=torch.bfloat16, device="cuda")
-        mla_decode_fwd(
-            q.view(-1, nq, dq),
-            kv_buffer_4d,
-            o,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            max_q_len,
-            page_size=PAGE_SIZE,
-            nhead_kv=nkv,
-            sm_scale=SM_SCALE,
-            logit_cap=0.0,
-            num_kv_splits=NUM_KV_SPLITS,
-            kv_scale=kv_scale,
-            intra_batch_mode=True,
-            **meta,
-        )
-        return o
-    else:
-        # Prefill: non-persistent bf16 mode (mxfp4/fp8 already dequantized above)
-        max_q_len = int((qo_indptr[1:] - qo_indptr[:-1]).max().item())
-        kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
-
-        o = torch.empty((q.shape[0], nq, dv), dtype=torch.bfloat16, device="cuda")
-        mla_prefill_fwd(
-            q.view(-1, nq, dq),
-            kv_buffer_4d,
-            o,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            max_q_len,
-            sm_scale=SM_SCALE,
-            logit_cap=0.0,
-        )
-        return o
+    o = torch.empty((q.shape[0], nq, dv), dtype=torch.bfloat16, device="cuda")
+    mla_decode_fwd(
+        q.view(-1, nq, dq),
+        kv_buffer_4d,
+        o,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        max_q_len,
+        page_size=PAGE_SIZE,
+        nhead_kv=nkv,
+        sm_scale=SM_SCALE,
+        logit_cap=0.0,
+        num_kv_splits=NUM_KV_SPLITS,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        intra_batch_mode=True,
+        **meta,
+    )
+    return o
 
 
 # ---------------------------------------------------------------------------
 # generate_input / ref_kernel / check_implementation
 # ---------------------------------------------------------------------------
 
-def generate_input(batchsize: int, qseqlen: int, kvseqlen: int, kvdtype: str, seed: int) -> input_t:
+def generate_input(batchsize: int, qseqlen: int, kvseqlen: int, seed: int) -> input_t:
     """
     Generate absorbed q and compressed kv_buffer for MLA decode.
 
-    KV cache quantization:
-      - bf16:  kv_buffer stays bfloat16, kv_scale=None
-      - fp8:   dynamic per-tensor quantization → fp8 kv_buffer + scalar kv_scale
-      - mxfp4: aiter dynamic_mxfp4_quant (block-32)
-               → fp4x2 kv_buffer + fp8_e8m0 kv_scale
+    Returns all three KV cache formats in kv_data dict:
+      kv_data = {
+        "bf16":  Tensor               — (total_kv, 1, 576) bfloat16
+        "fp8":   (Tensor, Tensor)     — kv_buffer fp8 + scalar scale
+        "mxfp4": (Tensor, Tensor)     — kv_buffer fp4x2 + fp8_e8m0 scale
+      }
     """
     gen = torch.Generator(device="cuda")
     gen.manual_seed(seed)
@@ -342,25 +308,24 @@ def generate_input(batchsize: int, qseqlen: int, kvseqlen: int, kvdtype: str, se
         dtype=torch.bfloat16, device="cuda", generator=gen,
     ) * 0.02
 
-    # Compressed KV buffer: (total_kv, 1, 576) bf16
+    # Compressed KV buffer: (total_kv, 1, 576) bf16 — the source of truth
     kv_buffer_bf16 = torch.randn(
         (total_kv, NUM_KV_HEADS, QK_HEAD_DIM),
         dtype=torch.bfloat16, device="cuda", generator=gen,
     ) * 0.02
 
-    # Quantize KV buffer to target dtype
-    kv_scale = None
-    if kvdtype == "bf16":
-        kv_buffer = kv_buffer_bf16
-    elif kvdtype == "fp8":
-        # Dynamic per-tensor FP8 quantization (sglang style)
-        kv_buffer, kv_scale = quantize_fp8(kv_buffer_bf16)
-    elif kvdtype == "mxfp4":
-        # Block-32 MXFP4 quantization using aiter (native fp4x2 + fp8_e8m0)
-        # kv_buffer: (total_kv, 1, 288) fp4x2, kv_scale: (total_kv, num_blocks) fp8_e8m0
-        kv_buffer, kv_scale = quantize_mxfp4(kv_buffer_bf16)
-    else:
-        raise ValueError(f"Unknown kvdtype: {kvdtype}. Use bf16, fp8, or mxfp4.")
+    # Quantize KV to fp8
+    kv_buffer_fp8, kv_scale_fp8 = quantize_fp8(kv_buffer_bf16)
+
+    # Quantize KV to mxfp4
+    kv_buffer_mxfp4, kv_scale_mxfp4 = quantize_mxfp4(kv_buffer_bf16)
+
+    # All three KV formats: bf16 is a Tensor, fp8/mxfp4 are (Tensor, Tensor) tuples
+    kv_data = {
+        "bf16": kv_buffer_bf16,
+        "fp8": (kv_buffer_fp8, kv_scale_fp8),
+        "mxfp4": (kv_buffer_mxfp4, kv_scale_mxfp4),
+    }
 
     qo_indptr = torch.arange(0, batchsize + 1, dtype=torch.int32, device="cuda") * qseqlen
     kv_indptr = torch.arange(0, batchsize + 1, dtype=torch.int32, device="cuda") * kvseqlen
@@ -376,22 +341,32 @@ def generate_input(batchsize: int, qseqlen: int, kvseqlen: int, kvdtype: str, se
         "q_seq_len": qseqlen,
         "kv_seq_len": kvseqlen,
         "sm_scale": SM_SCALE,
-        "kv_dtype": kvdtype,
-        "kv_scale": kv_scale,
     }
 
-    return (q, kv_buffer, qo_indptr, kv_indptr, config)
+    return (q, kv_data, qo_indptr, kv_indptr, config)
 
 
 def ref_kernel(data: input_t) -> output_t:
-    """Reference MLA attention using aiter kernels."""
-    q, kv_buffer, qo_indptr, kv_indptr, config = data
-    return _aiter_mla_attention(q, kv_buffer, qo_indptr, kv_indptr, config)
+    """Reference MLA decode attention. Uses Q_DTYPE and KV_DTYPE to select kernel variant."""
+    q, kv_data, qo_indptr, kv_indptr, config = data
+
+    # Resolve Q
+    if Q_DTYPE == "fp8":
+        q_input, q_scale = quantize_fp8(q)
+    else:
+        q_input, q_scale = q, None
+
+    # Resolve KV
+    if KV_DTYPE == "fp8":
+        kv_buffer_fp8, kv_scale = kv_data["fp8"]
+        kv_input = kv_buffer_fp8
+    else:
+        kv_input, kv_scale = kv_data["bf16"], None
+
+    return _aiter_mla_decode(
+        q_input, kv_input, qo_indptr, kv_indptr, config,
+        q_scale=q_scale, kv_scale=kv_scale,
+    )
 
 
-def check_implementation(data, output):
-    """Check submission output against aiter reference with per-dtype tolerance."""
-    config = data[-1]
-    kv_dtype = config.get("kv_dtype", "bf16")
-    tol = TOLERANCES.get(kv_dtype, TOLERANCES["bf16"])
-    return match_reference(data, output, ref_kernel, **tol)
+check_implementation = make_match_reference(ref_kernel, rtol=2e-02, atol=8e-03)
