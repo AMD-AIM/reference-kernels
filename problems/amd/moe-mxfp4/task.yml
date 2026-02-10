@@ -107,16 +107,17 @@ ranked_timeout: 840
 ranking_by: "geom"
 
 tests:
-  - {"dhidden": 4096, "dexpert": 1024, "nroutedexperts": 16, "nexpertspertoken": 4, "nsharedexperts": 1, "bs": 8, "seed": 9371}
-  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "nsharedexperts": 1, "bs": 32, "seed": 2291}
-  - {"dhidden": 4096, "dexpert": 1536, "nroutedexperts": 64, "nexpertspertoken": 6, "nsharedexperts": 1, "bs": 128, "seed": 81934}
+  - {"bs": 8, "dhidden": 4096, "dexpert": 1024, "nroutedexperts": 16, "nexpertspertoken": 4, "nsharedexperts": 1, "seed": 9371}
+  - {"bs": 32, "dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "nsharedexperts": 1, "seed": 2291}
+  - {"bs": 128, "dhidden": 4096, "dexpert": 1536, "nroutedexperts": 64, "nexpertspertoken": 6, "nsharedexperts": 1, "seed": 81934}
 
 benchmarks:
   # EP off (all 257 experts on 1 GPU): E=257, top_k=9 (8 routed + 1 shared)
-  - {"dhidden": 7168, "dexpert": 256, "nroutedexperts": 256, "nexpertspertoken": 8, "nsharedexperts": 1, "bs": 4, "seed": 9371}
-  - {"dhidden": 7168, "dexpert": 256, "nroutedexperts": 256, "nexpertspertoken": 8, "nsharedexperts": 1, "bs": 64, "seed": 2291}
-  - {"dhidden": 7168, "dexpert": 256, "nroutedexperts": 256, "nexpertspertoken": 8, "nsharedexperts": 1, "bs": 256, "seed": 81934}
-  # EP on (EP=8, 33 experts per GPU): E=33, top_k=9 (8 routed + 1 shared)
-  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "nsharedexperts": 1, "bs": 64, "seed": 2291}
-  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "nsharedexperts": 1, "bs": 256, "seed": 81934}
-  - {"dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "nsharedexperts": 1, "bs": 1024, "seed": 81934}
+  - {"bs": 4, "dhidden": 7168, "dexpert": 256, "nroutedexperts": 256, "nexpertspertoken": 8, "nsharedexperts": 1, "seed": 9371}
+  - {"bs": 64, "dhidden": 7168, "dexpert": 256, "nroutedexperts": 256, "nexpertspertoken": 8, "nsharedexperts": 1, "seed": 2291}
+  - {"bs": 256, "dhidden": 7168, "dexpert": 256, "nroutedexperts": 256, "nexpertspertoken": 8, "nsharedexperts": 1, "seed": 81934}
+  # EP on (EP=8, 33 experts per GPU): E=33, top_k=9 (8 routed + 1 shared) 
+  # NOTE: In actural ep, the shared expert we calculated will divide by ep_size, here we ignore it to calculate the full.
+  - {"bs": 64, "dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "nsharedexperts": 1, "seed": 2291}
+  - {"bs": 256, "dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "nsharedexperts": 1, "seed": 81934}
+  - {"bs": 1024, "dhidden": 7168, "dexpert": 2048, "nroutedexperts": 32, "nexpertspertoken": 8, "nsharedexperts": 1, "seed": 81934}
