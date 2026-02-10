@@ -16,8 +16,8 @@ description: |
   The absorbed query and compressed KV cache are provided directly — you only need to
   implement the **attention** computation with variable-length batching (indptr).
 
-  The reference uses aiter bf16 MLA decode kernel (mla_decode_fwd, persistent mode)
-  for highest precision. Your submission is checked against this bf16 reference.
+  The reference uses aiter a8w8 MLA decode kernel (mla_decode_fwd, fp8 Q + fp8 KV,
+  persistent mode), which is ~2-3x faster than bf16 on MI355X.
 
   DeepSeek R1 forward_absorb MLA config:
     - num_heads = 16 (query heads, after TP split)
@@ -48,13 +48,13 @@ description: |
     - attention output: (total_q, 16, 512) bfloat16
 
   Key optimization opportunities:
-    1. Use fp8/mxfp4 KV cache to reduce memory bandwidth (decode is memory-bound)
-       - fp8: aiter supports bf16-Q + fp8-KV (a16w8) persistent MLA kernel natively
-       - mxfp4: fuse dequantization + attention to skip bf16 materialization
-    2. MQA: 1 KV head shared across 16 query heads — minimize redundant memory loads
-    3. Decode: q_seq_len=1, kv_seq_len up to 8k — memory-bound workload
-    4. Variable-length batching: indptr-based segmented attention
-    5. Split K/V from buffer: full 576 dims for keys, first 512 dims for values
+    1. Use mxfp4 KV cache for even lower memory bandwidth (4x savings over bf16)
+       - Fuse dequantization with attention to skip bf16 materialization
+    2. Custom kernel with tighter memory access patterns
+    3. MQA: 1 KV head shared across 16 query heads — minimize redundant memory loads
+    4. Decode: q_seq_len=1, kv_seq_len up to 8k — memory-bound workload
+    5. Variable-length batching: indptr-based segmented attention
+    6. Split K/V from buffer: full 576 dims for keys, first 512 dims for values
 
   The ranking criteria is the geometric mean of the benchmark results.
 
