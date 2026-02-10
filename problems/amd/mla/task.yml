@@ -72,40 +72,28 @@ tests:
   # bs=4
   - {"batchsize": 4, "qseqlen": 1, "kvseqlen": 1024, "seed": 4217}
   - {"batchsize": 4, "qseqlen": 1, "kvseqlen": 8192, "seed": 4220}
-  # bs=8
-  - {"batchsize": 8, "qseqlen": 1, "kvseqlen": 1024, "seed": 2891}
-  - {"batchsize": 8, "qseqlen": 1, "kvseqlen": 8192, "seed": 2894}
-  # bs=16
-  - {"batchsize": 16, "qseqlen": 1, "kvseqlen": 1024, "seed": 7631}
-  - {"batchsize": 16, "qseqlen": 1, "kvseqlen": 8192, "seed": 7634}
   # bs=32
   - {"batchsize": 32, "qseqlen": 1, "kvseqlen": 1024, "seed": 5412}
   - {"batchsize": 32, "qseqlen": 1, "kvseqlen": 8192, "seed": 5415}
   # bs=64
   - {"batchsize": 64, "qseqlen": 1, "kvseqlen": 1024, "seed": 1357}
   - {"batchsize": 64, "qseqlen": 1, "kvseqlen": 8192, "seed": 1360}
-  # bs=128
-  - {"batchsize": 128, "qseqlen": 1, "kvseqlen": 1024, "seed": 9823}
-  - {"batchsize": 128, "qseqlen": 1, "kvseqlen": 8192, "seed": 9826}
+  # bs=256
+  - {"batchsize": 256, "qseqlen": 1, "kvseqlen": 1024, "seed": 9823}
+  - {"batchsize": 256, "qseqlen": 1, "kvseqlen": 8192, "seed": 9826}
 
 benchmarks:
   # bs=4
   - {"batchsize": 4, "qseqlen": 1, "kvseqlen": 1024, "seed": 4217}
   - {"batchsize": 4, "qseqlen": 1, "kvseqlen": 8192, "seed": 4220}
-  # bs=8
-  - {"batchsize": 8, "qseqlen": 1, "kvseqlen": 1024, "seed": 2891}
-  - {"batchsize": 8, "qseqlen": 1, "kvseqlen": 8192, "seed": 2894}
-  # bs=16
-  - {"batchsize": 16, "qseqlen": 1, "kvseqlen": 1024, "seed": 7631}
-  - {"batchsize": 16, "qseqlen": 1, "kvseqlen": 8192, "seed": 7634}
   # bs=32
   - {"batchsize": 32, "qseqlen": 1, "kvseqlen": 1024, "seed": 5412}
   - {"batchsize": 32, "qseqlen": 1, "kvseqlen": 8192, "seed": 5415}
   # bs=64
   - {"batchsize": 64, "qseqlen": 1, "kvseqlen": 1024, "seed": 1357}
   - {"batchsize": 64, "qseqlen": 1, "kvseqlen": 8192, "seed": 1360}
-  # bs=128
-  - {"batchsize": 128, "qseqlen": 1, "kvseqlen": 1024, "seed": 9823}
-  - {"batchsize": 128, "qseqlen": 1, "kvseqlen": 8192, "seed": 9826}
+  # bs=256
+  - {"batchsize": 256, "qseqlen": 1, "kvseqlen": 1024, "seed": 9823}
+  - {"batchsize": 256, "qseqlen": 1, "kvseqlen": 8192, "seed": 9826}
 
 ranking_by: "geom"
