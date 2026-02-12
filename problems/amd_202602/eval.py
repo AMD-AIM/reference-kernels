@@ -289,7 +289,7 @@ def run_benchmarking(logger: PopcornOutput, pool: multiprocessing.Pool, tests: l
     logger.log("benchmark-count", len(tests))
     for idx, test in enumerate(tests):
         logger.log(f"benchmark.{idx}.spec", test.spec)
-        result = run_single_benchmark(pool, test, False, 100, 10e9)
+        result = run_single_benchmark(pool, test, False, 1000, 50e9)
         if isinstance(result, Stats):
             for field in dataclasses.fields(Stats):
                 logger.log(f"benchmark.{idx}.{field.name}", getattr(result, field.name))
